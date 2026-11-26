@@ -190,6 +190,8 @@ enum AppMsg {
     SaveTo { tab: u64, path: PathBuf },
     ExportCsv { path: PathBuf, csv: String },
     Password { key: String, password: String },
+    /// Who the current Kerberos ticket belongs to.
+    Principal(Result<String, String>),
     Error(String),
 }
 
@@ -200,6 +202,9 @@ struct ConnectDialog {
     then_query: bool,
     /// Connect this tab instead of adding a server to Object Explorer.
     for_tab: Option<u64>,
+    /// The current Kerberos ticket, once looked up.
+    principal: Option<Result<String, String>>,
+    checking_principal: bool,
 }
 
 enum Confirm {
@@ -324,7 +329,14 @@ impl App {
         let info = self.settings.recent.first().cloned().unwrap_or_default();
         let key = info.key();
         let remember = info.remember_password;
-        self.connect = Some(ConnectDialog { info, show_options: false, then_query, for_tab });
+        self.connect = Some(ConnectDialog {
+            info,
+            show_options: false,
+            then_query,
+            for_tab,
+            principal: None,
+            checking_principal: false,
+        });
         if remember {
             self.load_password(key);
         }
@@ -625,6 +637,12 @@ impl App {
                         if d.info.key() == key && d.info.password.is_empty() {
                             d.info.password = password;
                         }
+                    }
+                }
+                AppMsg::Principal(p) => {
+                    if let Some(d) = &mut self.connect {
+                        d.principal = Some(p);
+                        d.checking_principal = false;
                     }
                 }
                 AppMsg::Error(e) => self.notify(e, true),
@@ -1236,6 +1254,15 @@ impl App {
     }
 
     fn connect_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(d) = &mut self.connect {
+            if d.info.auth == db::Auth::Kerberos && d.principal.is_none() && !d.checking_principal {
+                d.checking_principal = true;
+                let tx = self.msg_tx.clone();
+                self.rt.spawn_blocking(move || {
+                    let _ = tx.send(AppMsg::Principal(crate::kerberos::current_principal()));
+                });
+            }
+        }
         let Some(d) = &mut self.connect else { return };
         let mut go = false;
         let mut cancel = false;
@@ -1278,17 +1305,31 @@ impl App {
 
                 ui.label("Authentication:");
                 egui::ComboBox::from_id_salt("auth").width(260.0).selected_text(d.info.auth.label()).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut d.info.auth, db::Auth::SqlServer, db::Auth::SqlServer.label());
-                    ui.selectable_value(&mut d.info.auth, db::Auth::Windows, db::Auth::Windows.label());
+                    for a in db::Auth::ALL {
+                        ui.selectable_value(&mut d.info.auth, a, a.label());
+                    }
                 });
                 ui.end_row();
 
-                ui.label(if d.info.auth == db::Auth::Windows { "User (DOMAIN\\user):" } else { "Login:" });
-                ui.add(egui::TextEdit::singleline(&mut d.info.user).desired_width(260.0));
+                let kerberos = d.info.auth == db::Auth::Kerberos;
+                let (user_label, user_hint, pw_hint) = match d.info.auth {
+                    db::Auth::Kerberos => (
+                        "User name:",
+                        match &d.principal {
+                            Some(Ok(p)) => p.clone(),
+                            _ => "user@DOMAIN.COM".to_string(),
+                        },
+                        "blank = use current ticket",
+                    ),
+                    db::Auth::Windows => ("User name:", r"DOMAIN\user".to_string(), ""),
+                    db::Auth::SqlServer => ("Login:", String::new(), ""),
+                };
+                ui.label(user_label);
+                ui.add(egui::TextEdit::singleline(&mut d.info.user).hint_text(user_hint).desired_width(260.0));
                 ui.end_row();
 
                 ui.label("Password:");
-                let pw = ui.add(egui::TextEdit::singleline(&mut d.info.password).password(true).desired_width(260.0));
+                let pw = ui.add(egui::TextEdit::singleline(&mut d.info.password).password(true).hint_text(pw_hint).desired_width(260.0));
                 if pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     go = true;
                 }
@@ -1297,6 +1338,29 @@ impl App {
                 ui.label("");
                 ui.checkbox(&mut d.info.remember_password, "Remember password (system keyring)");
                 ui.end_row();
+
+                if kerberos {
+                    ui.label("");
+                    match &d.principal {
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.weak("Checking for a Kerberos ticket…");
+                            });
+                        }
+                        Some(Ok(p)) => {
+                            ui.label(RichText::new(format!("✔ Signed in to the domain as {p}")).color(Color32::from_rgb(70, 170, 90)));
+                        }
+                        Some(Err(e)) => {
+                            let text = format!("No Kerberos ticket. Enter your domain user and password to sign in.\n{}", e.lines().next().unwrap_or(""));
+                            ui.vertical(|ui| {
+                                ui.set_max_width(300.0);
+                                ui.add(egui::Label::new(RichText::new(text).weak().small()).wrap());
+                            });
+                        }
+                    }
+                    ui.end_row();
+                }
             });
             ui.add_space(4.0);
             egui::CollapsingHeader::new("Options").default_open(d.show_options).show(ui, |ui| {
@@ -1320,6 +1384,11 @@ impl App {
                     ui.label("Application name:");
                     ui.add(egui::TextEdit::singleline(&mut d.info.app_name).desired_width(240.0));
                     ui.end_row();
+                    if d.info.auth == db::Auth::Kerberos {
+                        ui.label("Service principal (SPN):");
+                        ui.add(egui::TextEdit::singleline(&mut d.info.spn).hint_text("automatic: MSSQLSvc/<fqdn>:<port>").desired_width(240.0));
+                        ui.end_row();
+                    }
                 });
             });
             ui.add_space(8.0);
@@ -1433,7 +1502,7 @@ impl App {
             return;
         }
         let r = egui::Modal::new(Id::unique("about")).show(ctx, |ui| {
-            ui.heading(format!("SQL Studio {}", env!("CARGO_PKG_VERSION")));
+            ui.heading(format!("SQLCraft {}", env!("CARGO_PKG_VERSION")));
             ui.label("A SQL Server management studio for Linux.");
             ui.add_space(8.0);
             egui::Grid::new("keys").num_columns(2).striped(true).show(ui, |ui| {
@@ -1506,8 +1575,8 @@ impl eframe::App for App {
         }
 
         let title = match self.tabs.get(self.active) {
-            Some(t) => format!("{} - SQL Studio", t.title),
-            None => "SQL Studio".to_string(),
+            Some(t) => format!("{} - SQLCraft", t.title),
+            None => "SQLCraft".to_string(),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 

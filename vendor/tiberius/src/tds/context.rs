@@ -137,6 +137,10 @@ impl Context {
         self.spn = Some(format!("MSSQLSvc/{}:{}", host.as_ref(), port));
     }
 
+    pub fn set_spn_raw(&mut self, spn: String) {
+        self.spn = Some(spn);
+    }
+
     #[cfg(any(
         windows,
         all(unix, any(feature = "integrated-auth-gssapi", feature = "sspi-rs"))

@@ -1,0 +1,85 @@
+app-id: io.github.loganhoney.SQLCraft
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: sqlcraft
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Reach SQL Server and the domain controllers.
+  - --share=network
+  # Remember passwords in GNOME Keyring / KWallet via the Secret Service.
+  - --talk-name=org.freedesktop.secrets
+  # Active Directory (Kerberos): read the host's krb5.conf and the files it
+  # includes, use the tickets in the KCM credential cache that Fedora-based
+  # systems (Bazzite, Silverblue) use, and SSSD's KDC list on domain-joined machines.
+  - --filesystem=host-etc:ro
+  - --filesystem=/run/.heim_org.h5l.kcm-socket
+  - --filesystem=/var/lib/sss/pubconf:ro
+  # Files are opened and saved through the file chooser portal, so no home
+  # directory access is needed.
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/sqlcraft/cargo
+    CARGO_NET_OFFLINE: 'true'
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/man
+  - /share/examples
+  - /share/locale
+  - /var
+  - '*.la'
+modules:
+  # MIT Kerberos for Windows integrated authentication; the runtime has none.
+  - name: krb5
+    subdir: src
+    config-opts:
+      - --disable-static
+      - --disable-rpath
+      - --without-keyutils
+      - --without-libedit
+      - --without-system-verto
+      - --localstatedir=/var/lib
+    cleanup:
+      - /sbin
+      - /bin/kadmin
+      - /bin/kproplog
+      - /bin/ktutil
+      - /bin/sclient
+      - /bin/sim_client
+      - /bin/uuclient
+      - /bin/gss-client
+      - /bin/compile_et
+      - /bin/krb5-config
+      - /lib/krb5/plugins/kdb
+    sources:
+      - type: archive
+        url: https://kerberos.org/dist/krb5/1.22/krb5-1.22.3.tar.gz
+        sha256: fe90af8441ad9fa9b064b8e53077cefb782a96f8a68276b031dc54af1789ff0b
+
+  - name: sqlcraft
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release --locked --features kerberos
+      - install -Dm755 target/release/sqlcraft /app/bin/sqlcraft
+      - install -Dm644 flatpak/io.github.loganhoney.SQLCraft.desktop /app/share/applications/io.github.loganhoney.SQLCraft.desktop
+      - install -Dm644 flatpak/io.github.loganhoney.SQLCraft.metainfo.xml /app/share/metainfo/io.github.loganhoney.SQLCraft.metainfo.xml
+      - install -Dm644 flatpak/io.github.loganhoney.SQLCraft.svg /app/share/icons/hicolor/scalable/apps/io.github.loganhoney.SQLCraft.svg
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - .git
+          - .flatpak-builder
+          - flatpak/build-dir
+          - flatpak/repo
+          - flatpak/.flatpak-builder
+          - '*.flatpak'
+      - cargo-sources.json

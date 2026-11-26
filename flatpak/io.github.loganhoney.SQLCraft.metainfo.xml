@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.sqlstudio.SqlStudio</id>
-  <name>SQL Studio</name>
+  <id>io.github.loganhoney.SQLCraft</id>
+  <name>SQLCraft</name>
   <summary>Manage SQL Server databases and run T-SQL queries</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
-  <developer id="io.github.sqlstudio">
-    <name>SQL Studio contributors</name>
+  <developer id="io.github.loganhoney">
+    <name>SQLCraft contributors</name>
   </developer>
   <description>
     <p>
@@ -21,7 +21,8 @@
       <li>SQL Server and Windows (NTLM) logins, with passwords kept in the system keyring</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.github.sqlstudio.SqlStudio.desktop</launchable>
+  <url type="homepage">https://github.com/LoganHoney/SQLCraft</url>
+  <launchable type="desktop-id">io.github.loganhoney.SQLCraft.desktop</launchable>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="0.1.0" date="2026-11-26"/>

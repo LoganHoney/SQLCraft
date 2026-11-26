@@ -14,3 +14,8 @@ existing API:
 Files touched: `src/tds/stream/query.rs`, `src/tds/codec/token/token_done.rs`,
 `src/lib.rs`. Everything else is the crates.io 0.13.0 release
 (MIT OR Apache-2.0, see the LICENSE files).
+
+Also added `Config::service_principal_name()` to override the Kerberos SPN
+(the default `MSSQLSvc/<host>:<port>` is wrong for short host names and for
+named instances reached through SQL Browser). Touches `src/client/config.rs`,
+`src/client/connection.rs` and `src/tds/context.rs`.

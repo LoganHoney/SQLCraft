@@ -1,0 +1,42 @@
+name: Flatpak
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+
+  flatpak:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check cargo-sources.json matches Cargo.lock
+        run: |
+          python3 flatpak/gen-cargo-sources.py Cargo.lock /tmp/cargo-sources.json
+          diff -q /tmp/cargo-sources.json flatpak/cargo-sources.json
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: SQLCraft.flatpak
+          manifest-path: flatpak/io.github.loganhoney.SQLCraft.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SQLCraft.flatpak
+          generate_release_notes: true

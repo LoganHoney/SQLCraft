@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::ConnectionInfo;
 
-const KEYRING_SERVICE: &str = "sqlstudio";
+const KEYRING_SERVICE: &str = "sqlcraft";
 const MAX_RECENT: usize = 15;
 
 #[derive(Serialize, Deserialize)]
@@ -26,7 +26,7 @@ impl Default for Settings {
 }
 
 fn path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "sqlstudio").map(|d| d.config_dir().join("settings.json"))
+    directories::ProjectDirs::from("", "", "sqlcraft").map(|d| d.config_dir().join("settings.json"))
 }
 
 impl Settings {

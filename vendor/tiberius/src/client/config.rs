@@ -58,6 +58,7 @@ pub struct Config {
     pub(crate) readonly: bool,
     pub(crate) packet_size: Option<u32>,
     pub(crate) hostname_in_certificate: Option<String>,
+    pub(crate) service_principal_name: Option<String>,
     pub(crate) client_name: Option<String>,
     pub(crate) multi_subnet_failover: bool,
     pub(crate) handshake_timeout: Option<Duration>,
@@ -250,6 +251,7 @@ impl Default for Config {
             auth: AuthMethod::None,
             readonly: false,
             packet_size: None,
+            service_principal_name: None,
             hostname_in_certificate: None,
             client_name: None,
             multi_subnet_failover: false,
@@ -506,6 +508,12 @@ impl Config {
     /// [`host`]: Config::host
     pub fn hostname_in_certificate(&mut self, hostname: impl ToString) {
         self.hostname_in_certificate = Some(hostname.to_string());
+    }
+
+    /// Overrides the Kerberos service principal name used for integrated
+    /// authentication. Defaults to `MSSQLSvc/<host>:<port>`. (sqlcraft patch)
+    pub fn service_principal_name(&mut self, spn: impl ToString) {
+        self.service_principal_name = Some(spn.to_string());
     }
 
     /// Sets the client / workstation name reported to the server in the login

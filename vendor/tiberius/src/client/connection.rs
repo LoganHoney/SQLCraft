@@ -132,6 +132,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let context = {
             let mut context = Context::new();
             context.set_spn(config.get_host(), config.get_port());
+            if let Some(spn) = &config.service_principal_name {
+                context.set_spn_raw(spn.clone());
+            }
             // Row-decode preference; unrelated to handshake timing, so set it up
             // front alongside the SPN.
             context.set_lossy_utf16(config.lossy_utf16_decoding);

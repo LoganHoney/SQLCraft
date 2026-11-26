@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=SQL Studio
+Name=SQLCraft
 GenericName=SQL Server Management Studio
 Comment=Manage SQL Server databases and run T-SQL queries
-Exec=sqlstudio
-Icon=io.github.sqlstudio.SqlStudio
+Exec=sqlcraft
+Icon=io.github.loganhoney.SQLCraft
 Terminal=false
 Categories=Development;Database;
 Keywords=SQL;SQL Server;SSMS;MSSQL;T-SQL;database;query;
-StartupWMClass=io.github.sqlstudio.SqlStudio
+StartupWMClass=io.github.loganhoney.SQLCraft

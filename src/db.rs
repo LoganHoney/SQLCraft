@@ -23,13 +23,19 @@ pub enum Auth {
     SqlServer,
     /// NTLM with an explicit DOMAIN\user and password.
     Windows,
+    /// Active Directory Kerberos: the current ticket, or one obtained from
+    /// the user name and password given.
+    Kerberos,
 }
 
 impl Auth {
+    pub const ALL: [Auth; 3] = [Auth::Kerberos, Auth::Windows, Auth::SqlServer];
+
     pub fn label(self) -> &'static str {
         match self {
             Auth::SqlServer => "SQL Server Authentication",
             Auth::Windows => "Windows Authentication (NTLM)",
+            Auth::Kerberos => "Windows Authentication (Active Directory)",
         }
     }
 }
@@ -72,6 +78,8 @@ pub struct ConnectionInfo {
     pub trust_cert: bool,
     pub timeout_secs: u64,
     pub app_name: String,
+    /// Kerberos service principal override; empty means work it out.
+    pub spn: String,
 }
 
 impl Default for ConnectionInfo {
@@ -86,7 +94,8 @@ impl Default for ConnectionInfo {
             encrypt: Encrypt::Mandatory,
             trust_cert: false,
             timeout_secs: 15,
-            app_name: "SQL Studio".into(),
+            app_name: "SQLCraft".into(),
+            spn: String::new(),
         }
     }
 }
@@ -99,7 +108,11 @@ impl ConnectionInfo {
 
     /// The name shown on the Object Explorer root, e.g. `sql01 (SQL Server - sa)`.
     pub fn display(&self) -> String {
-        format!("{} ({})", self.server.trim(), self.user.trim())
+        let who = match (self.auth, self.user.trim()) {
+            (Auth::Kerberos, "") => "Active Directory",
+            (_, u) => u,
+        };
+        format!("{} ({who})", self.server.trim())
     }
 
     pub fn config(&self, database: Option<&str>) -> Config {
@@ -130,6 +143,11 @@ impl ConnectionInfo {
         c.authentication(match self.auth {
             Auth::SqlServer => AuthMethod::sql_server(&self.user, &self.password),
             Auth::Windows => AuthMethod::windows(&self.user, &self.password),
+            #[cfg(feature = "kerberos")]
+            Auth::Kerberos => AuthMethod::Integrated,
+            // connect() refuses Kerberos in builds without it.
+            #[cfg(not(feature = "kerberos"))]
+            Auth::Kerberos => AuthMethod::None,
         });
         c
     }
@@ -154,8 +172,35 @@ pub fn parse_server(s: &str) -> (String, Option<u16>, Option<String>) {
     (host, port, instance)
 }
 
+/// Gets a Kerberos ticket if a password was given, and works out the SPN.
+async fn prepare_kerberos(info: &ConnectionInfo, config: &mut Config) -> Result<(), String> {
+    let info = info.clone();
+    let spn = tokio::task::spawn_blocking(move || {
+        if !info.password.is_empty() {
+            let principal = crate::kerberos::principal_from_login(&info.user);
+            crate::kerberos::sign_in(&principal, &info.password)?;
+        } else {
+            // Fails early with a clear message when there is no ticket.
+            crate::kerberos::current_principal()?;
+        }
+        if !info.spn.trim().is_empty() {
+            return Ok(info.spn.trim().to_string());
+        }
+        let (host, port, instance) = parse_server(&info.server);
+        Ok(crate::kerberos::service_principal(&host, port, instance.as_deref()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e: String| crate::kerberos::explain(&e))?;
+    config.service_principal_name(spn);
+    Ok(())
+}
+
 async fn connect(info: &ConnectionInfo, database: Option<&str>) -> Result<Conn, String> {
     let mut config = info.config(database);
+    if info.auth == Auth::Kerberos {
+        prepare_kerberos(info, &mut config).await?;
+    }
     // Azure SQL may redirect us to another node; follow it once.
     for _ in 0..2 {
         let tcp = tokio::time::timeout(
@@ -172,6 +217,7 @@ async fn connect(info: &ConnectionInfo, database: Option<&str>) -> Result<Conn, 
                 config.host(&host);
                 config.port(port);
             }
+            Err(e) if info.auth == Auth::Kerberos => return Err(crate::kerberos::explain(&e.to_string())),
             Err(e) => return Err(e.to_string()),
         }
     }

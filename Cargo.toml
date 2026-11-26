@@ -1,5 +1,5 @@
 [package]
-name = "sqlstudio"
+name = "sqlcraft"
 version = "0.1.0"
 edition = "2024"
 description = "SQL Server management studio for Linux"
@@ -13,6 +13,8 @@ egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
 egui_extras = { version = "0.37.0", features = ["syntect"] }
 futures-util = "0.3.34"
 keyring = "4.2.0"
+libc = "0.2.191"
+libgssapi = { version = "0.11", default-features = false, features = ["store"], optional = true }
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -28,3 +30,8 @@ tiberius = { path = "vendor/tiberius" }
 [profile.release]
 lto = "thin"
 strip = true
+
+[features]
+# Windows integrated (Kerberos) authentication against Active Directory.
+# Needs MIT krb5 headers and libclang at build time; the Flatpak enables it.
+kerberos = ["tiberius/integrated-auth-gssapi", "dep:libgssapi"]
