@@ -39,8 +39,16 @@ jobs:
           flatpak list --runtime --columns=application,branch,installation
           if ! flatpak-builder --repo=repo --disable-rofiles-fuse \
                 --force-clean build-dir flatpak/io.github.loganhoney.SQLCraft.yml 2>&1 | tee build.log; then
-            # Annotations are readable without signing in, unlike job logs.
-            grep -v -e 'cargo:rerun-if' -e '^ *Compiling ' build.log | tail -n 120 | python3 -c "import sys; t=sys.stdin.read()[-60000:]; print('::error title=flatpak-builder failed::' + t.replace('%', '%25').replace('\r', '').replace('\n', '%0A'))"
+            # Annotations are readable without signing in, unlike job logs, but
+            # each holds 4 KB and a step gets 10, so post the tail in pieces.
+            grep -v -e 'cargo:rerun-if' -e '^ *Compiling ' -e '^\[[0-9]*\] ' -e 'debuginfo' -e '^processing: ' -e '^stripping ' build.log \
+              | tail -c 32000 | python3 -c "
+          import sys
+          t = sys.stdin.read()
+          for i in range(0, len(t), 3800):
+              part = t[i:i + 3800].replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+              print(f'::error title=flatpak-builder log {i // 3800 + 1}::' + part)
+          "
             exit 1
           fi
           flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
