@@ -32,8 +32,12 @@ jobs:
       - name: Build Flatpak
         run: |
           set -o pipefail
-          flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-          if ! flatpak-builder --repo=repo --disable-rofiles-fuse --install-deps-from=flathub \
+          # The image ships the 25.08 Platform and Sdk; updating them in place
+          # fails ("Invalid cross-device link"), so only add the Rust extension.
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.freedesktop.Sdk.Extension.rust-stable//25.08
+          flatpak list --runtime --columns=application,branch,installation
+          if ! flatpak-builder --repo=repo --disable-rofiles-fuse \
                 --force-clean build-dir flatpak/io.github.loganhoney.SQLCraft.yml 2>&1 | tee build.log; then
             # Annotations are readable without signing in, unlike job logs.
             tail -n 150 build.log | python3 -c "import sys; t=sys.stdin.read()[-60000:]; print('::error title=flatpak-builder failed::' + t.replace('%', '%25').replace('\r', '').replace('\n', '%0A'))"
