@@ -80,6 +80,8 @@ pub struct ConnectionInfo {
     pub app_name: String,
     /// Kerberos service principal override; empty means work it out.
     pub spn: String,
+    /// SSMS's "Use custom color": tints the query window status bar.
+    pub color: Option<[u8; 3]>,
 }
 
 impl Default for ConnectionInfo {
@@ -96,6 +98,7 @@ impl Default for ConnectionInfo {
             timeout_secs: 15,
             app_name: "SQLCraft".into(),
             spn: String::new(),
+            color: None,
         }
     }
 }

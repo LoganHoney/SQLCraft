@@ -325,6 +325,57 @@ fn database_node(id: u64, name: &str, state: &str) -> Node {
     Node::new(id, label, Kind::Database { db: name.to_string() })
 }
 
+/// One row whose columns are the Properties window entries for a node.
+pub fn properties_sql(kind: &Kind) -> Option<String> {
+    Some(match kind {
+        Kind::Server => "SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) AS [Name], \
+             CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS [Version], \
+             CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS [Edition], \
+             CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)) AS [Product Level], \
+             CAST(SERVERPROPERTY('ProductUpdateLevel') AS nvarchar(128)) AS [Update Level], \
+             CAST(SERVERPROPERTY('Collation') AS nvarchar(128)) AS [Server Collation], \
+             CAST(SERVERPROPERTY('IsClustered') AS nvarchar(10)) AS [Is Clustered], \
+             CAST(SERVERPROPERTY('IsHadrEnabled') AS nvarchar(10)) AS [Is HADR Enabled], \
+             CAST(SERVERPROPERTY('IsIntegratedSecurityOnly') AS nvarchar(10)) AS [Windows Authentication Only], \
+             (SELECT CAST(cpu_count AS nvarchar(10)) FROM sys.dm_os_sys_info) AS [Processors], \
+             (SELECT CAST(physical_memory_kb / 1024 AS nvarchar(20)) + ' MB' FROM sys.dm_os_sys_info) AS [Memory], \
+             (SELECT CONVERT(nvarchar(30), sqlserver_start_time, 120) FROM sys.dm_os_sys_info) AS [Started], \
+             @@VERSION AS [Full Version]"
+            .into(),
+        Kind::Database { db } => format!(
+            "SELECT d.name AS [Name], d.state_desc AS [Status], SUSER_SNAME(d.owner_sid) AS [Owner], \
+             CONVERT(nvarchar(30), d.create_date, 120) AS [Date Created], d.recovery_model_desc AS [Recovery Model], \
+             d.collation_name AS [Collation], CAST(d.compatibility_level AS nvarchar(10)) AS [Compatibility Level], \
+             d.user_access_desc AS [Restrict Access], CAST(d.is_read_only AS nvarchar(5)) AS [Read Only], \
+             (SELECT CAST(CAST(SUM(size) * 8 / 1024.0 AS decimal(18,2)) AS nvarchar(30)) + ' MB' FROM sys.master_files f WHERE f.database_id = d.database_id) AS [Size], \
+             (SELECT CONVERT(nvarchar(30), MAX(backup_finish_date), 120) FROM msdb.dbo.backupset b WHERE b.database_name = d.name AND b.type = 'D') AS [Last Database Backup] \
+             FROM sys.databases d WHERE d.name = {}",
+            lit(db)
+        ),
+        Kind::Table { db, schema, name } => format!(
+            "SELECT t.name AS [Name], s.name AS [Schema], CONVERT(nvarchar(30), t.create_date, 120) AS [Created Date], \
+             CONVERT(nvarchar(30), t.modify_date, 120) AS [Modified Date], \
+             (SELECT CAST(SUM(p.rows) AS nvarchar(30)) FROM {d}.sys.partitions p WHERE p.object_id = t.object_id AND p.index_id IN (0, 1)) AS [Row Count], \
+             (SELECT CAST(CAST(SUM(a.used_pages) * 8 / 1024.0 AS decimal(18,2)) AS nvarchar(30)) + ' MB' FROM {d}.sys.partitions p JOIN {d}.sys.allocation_units a ON a.container_id = p.partition_id WHERE p.object_id = t.object_id) AS [Data Space Used], \
+             t.lock_escalation_desc AS [Lock Escalation], CAST(t.is_memory_optimized AS nvarchar(5)) AS [Memory Optimized], \
+             t.temporal_type_desc AS [Temporal Type] \
+             FROM {d}.sys.tables t JOIN {d}.sys.schemas s ON s.schema_id = t.schema_id WHERE t.object_id = OBJECT_ID({o})",
+            d = qi(db),
+            o = object(db, schema, name)
+        ),
+        Kind::View { db, schema, name } | Kind::Procedure { db, schema, name } | Kind::Function { db, schema, name, .. } => format!(
+            "SELECT o.name AS [Name], s.name AS [Schema], o.type_desc AS [Type], CONVERT(nvarchar(30), o.create_date, 120) AS [Created Date], \
+             CONVERT(nvarchar(30), o.modify_date, 120) AS [Modified Date], \
+             CAST(OBJECTPROPERTY(o.object_id, 'IsEncrypted') AS nvarchar(5)) AS [Encrypted], \
+             CAST(OBJECTPROPERTY(o.object_id, 'IsSchemaBound') AS nvarchar(5)) AS [Schema Bound] \
+             FROM {d}.sys.objects o JOIN {d}.sys.schemas s ON s.schema_id = o.schema_id WHERE o.object_id = OBJECT_ID({o})",
+            d = qi(db),
+            o = object(db, schema, name)
+        ),
+        _ => return None,
+    })
+}
+
 // ----- Scripting --------------------------------------------------------
 
 pub fn select_top(db: &str, schema: &str, name: &str, columns: &[String], n: u32) -> String {

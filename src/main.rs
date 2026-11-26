@@ -3,10 +3,16 @@
 mod app;
 mod batch;
 mod db;
+mod dialogs;
 mod explorer;
 mod format;
 mod kerberos;
+mod query_ui;
 mod settings;
+mod templates;
+mod theme;
+mod tsql;
+mod ui;
 
 /// Must match the Flatpak app ID and the .desktop file name, so the window
 /// gets the right icon and taskbar grouping.

@@ -1,32 +1,24 @@
+//! Application state and the actions behind menus, toolbars and shortcuts.
+//! The UI lives in `ui.rs` (shell, tool windows), `query_ui.rs` (query
+//! windows) and `dialogs.rs`.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{
-    self, Align, Color32, Id, Key, KeyboardShortcut, Layout, Modifiers, RichText, Sense, TextStyle,
-    collapsing_header::CollapsingState,
-};
-use egui_extras::{Column, TableBuilder};
+use eframe::egui::{self, Color32, collapsing_header::CollapsingState};
+use egui_dock::{DockState, NodeIndex};
 use serde::{Deserialize, Serialize};
 
-use crate::batch;
-use crate::db::{self, ColumnInfo, ConnectionInfo, Event, Message, Request, ServerInfo, Session, Table};
+use crate::batch::{self, Batch};
+use crate::db::{ColumnInfo, ConnectionInfo, Event, Message, Request, ServerInfo, Session, Table};
 use crate::explorer::{self, Kind, Node};
-use crate::format::{csv_field, qi};
+use crate::format::{csv_field, lit, qi};
 use crate::settings::{self, Settings};
-
-const EXECUTE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F5);
-const EXECUTE_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::E);
-const CANCEL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::Pause);
-const NEW_QUERY: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::N);
-const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::O);
-const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::S);
-const CLOSE_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::F4);
-const CLOSE_TAB_ALT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::W);
-const TOGGLE_RESULTS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::R);
-const TOGGLE_EXPLORER: KeyboardShortcut = KeyboardShortcut::new(Modifiers::NONE, Key::F8);
-const NEXT_TAB: KeyboardShortcut = KeyboardShortcut::new(Modifiers::CTRL, Key::Tab);
+use crate::templates::Param;
+use crate::theme;
+use crate::tsql;
 
 /// Tags at or above this are fetches whose result nobody waits for.
 const FIRE_AND_FORGET: u64 = u64::MAX / 2;
@@ -34,25 +26,25 @@ const FIRE_AND_FORGET: u64 = u64::MAX / 2;
 // ----- Model --------------------------------------------------------------
 
 #[derive(PartialEq)]
-enum ServerState {
+pub(crate) enum ServerState {
     Connecting,
     Connected,
     Failed(String),
 }
 
-struct Server {
-    id: u64,
-    session: Session,
-    info: Option<ServerInfo>,
-    state: ServerState,
-    root: Node,
-    databases: Vec<String>,
+pub(crate) struct Server {
+    pub id: u64,
+    pub session: Session,
+    pub info: Option<ServerInfo>,
+    pub state: ServerState,
+    pub root: Node,
+    pub databases: Vec<String>,
 }
 
-struct ResultSet {
-    columns: Vec<ColumnInfo>,
-    rows: Vec<Vec<Option<String>>>,
-    widths: Vec<f32>,
+pub(crate) struct ResultSet {
+    pub columns: Vec<ColumnInfo>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub widths: Vec<f32>,
 }
 
 impl ResultSet {
@@ -73,15 +65,15 @@ impl ResultSet {
         self.rows.extend(rows);
     }
 
-    fn header_line(&self, sep: &str) -> String {
+    pub fn header_line(&self, sep: &str) -> String {
         self.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(sep)
     }
 
-    fn row_line(&self, r: usize, sep: &str) -> String {
+    pub fn row_line(&self, r: usize, sep: &str) -> String {
         self.rows[r].iter().map(|v| v.as_deref().unwrap_or("NULL")).collect::<Vec<_>>().join(sep)
     }
 
-    fn to_csv(&self) -> String {
+    pub fn to_csv(&self) -> String {
         let mut s = self.columns.iter().map(|c| csv_field(&c.name)).collect::<Vec<_>>().join(",");
         s.push_str("\r\n");
         for row in &self.rows {
@@ -91,6 +83,41 @@ impl ResultSet {
         }
         s
     }
+
+    /// The fixed-width layout of "Results to Text".
+    pub fn to_text(&self) -> String {
+        const MAX: usize = 256;
+        let cell = |v: &Option<String>| -> String {
+            v.as_deref().unwrap_or("NULL").replace(['\r', '\n', '\t'], " ").chars().take(MAX).collect()
+        };
+        let mut widths: Vec<usize> = self.columns.iter().map(|c| c.name.chars().count().min(MAX)).collect();
+        for row in &self.rows {
+            for (w, v) in widths.iter_mut().zip(row) {
+                *w = (*w).max(cell(v).chars().count());
+            }
+        }
+        let pad = |s: &str, w: usize, right: bool| {
+            if right { format!("{s:>w$}") } else { format!("{s:<w$}") }
+        };
+        let mut out = String::new();
+        let header: Vec<_> = self.columns.iter().zip(&widths).map(|(c, w)| pad(&c.name, *w, false)).collect();
+        out.push_str(header.join(" ").trim_end());
+        out.push('\n');
+        let dashes: Vec<_> = widths.iter().map(|w| "-".repeat(*w)).collect();
+        out.push_str(&dashes.join(" "));
+        out.push('\n');
+        for row in &self.rows {
+            let line: Vec<_> = row
+                .iter()
+                .zip(&widths)
+                .zip(&self.columns)
+                .map(|((v, w), c)| pad(&cell(v), *w, c.numeric))
+                .collect();
+            out.push_str(line.join(" ").trim_end());
+            out.push('\n');
+        }
+        out
+    }
 }
 
 fn text_width(s: &str) -> f32 {
@@ -99,51 +126,112 @@ fn text_width(s: &str) -> f32 {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Outcome {
+pub(crate) enum Outcome {
     Success,
     Errors,
     Cancelled,
 }
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub(crate) enum ResultsMode {
+    Grid,
+    Text,
+    File,
+}
+
 #[derive(PartialEq, Clone, Copy)]
-enum ResultsView {
-    Set(usize),
+pub(crate) enum ResultsView {
+    Results,
     Messages,
 }
 
-struct QueryTab {
-    id: u64,
-    title: String,
-    path: Option<PathBuf>,
-    sql: String,
-    saved_sql: String,
-    server: Option<u64>,
-    session: Option<Session>,
-    server_info: Option<ServerInfo>,
-    database: String,
-    connect_error: Option<String>,
-    running: bool,
-    started: Option<Instant>,
-    elapsed: Option<Duration>,
-    outcome: Option<Outcome>,
-    results: Vec<ResultSet>,
-    messages: Vec<Message>,
-    view: ResultsView,
-    show_results: bool,
+/// What arrived, in order, so Results to Text can interleave sets and messages.
+#[derive(Clone, Copy)]
+pub(crate) enum Item {
+    Set(usize),
+    Message(usize),
+}
+
+pub(crate) struct FindBar {
+    pub needle: String,
+    pub replace: Option<String>,
+    pub match_case: bool,
+    pub focus: bool,
+}
+
+pub(crate) struct QueryTab {
+    pub id: u64,
+    pub title: String,
+    pub path: Option<PathBuf>,
+    pub sql: String,
+    pub saved_sql: String,
+    pub server: Option<u64>,
+    pub session: Option<Session>,
+    pub server_info: Option<ServerInfo>,
+    pub database: String,
+    pub connect_error: Option<String>,
+    pub running: bool,
+    pub started: Option<Instant>,
+    pub elapsed: Option<Duration>,
+    pub outcome: Option<Outcome>,
+    pub results: Vec<ResultSet>,
+    pub messages: Vec<Message>,
+    pub order: Vec<Item>,
+    pub view: ResultsView,
+    pub mode: ResultsMode,
+    pub show_results: bool,
     /// Character range selected in the editor.
-    selection: Option<(usize, usize)>,
+    pub selection: Option<(usize, usize)>,
+    /// Selection to put into the editor on the next frame.
+    pub set_selection: Option<(usize, usize)>,
+    pub scroll_to_cursor: bool,
     /// (result set, row, column) of the selected grid cell.
-    cell: Option<(usize, usize, usize)>,
-    focus_editor: bool,
+    pub cell: Option<(usize, usize, usize)>,
+    pub focus_editor: bool,
+    pub find: Option<FindBar>,
+    /// Where "Results to File" writes once the run finishes.
+    pub file_target: Option<PathBuf>,
 }
 
 impl QueryTab {
-    fn dirty(&self) -> bool {
+    pub fn dirty(&self) -> bool {
         self.sql != self.saved_sql
     }
 
-    fn total_rows(&self) -> usize {
+    pub fn total_rows(&self) -> usize {
         self.results.iter().map(|r| r.rows.len()).sum()
+    }
+
+    pub fn editor_id(&self) -> egui::Id {
+        egui::Id::unique(("sql", self.id))
+    }
+
+    /// SSMS's window caption: `SQLQuery1.sql - SQL01.master (sa (55))*`.
+    pub fn caption(&self, server: Option<&str>) -> String {
+        let star = if self.dirty() { "*" } else { "" };
+        match (&self.server_info, server) {
+            (Some(i), Some(s)) => format!("{} - {s}.{} ({} ({})){star}", self.title, self.database, i.login, i.spid),
+            (None, Some(s)) if self.session.is_some() => format!("{} - {s} (connecting…){star}", self.title),
+            _ => format!("{} - not connected{star}", self.title),
+        }
+    }
+
+    /// Messages and result sets as one text, for Results to Text / File.
+    pub fn text_output(&self) -> String {
+        let mut out = String::new();
+        for item in &self.order {
+            match *item {
+                Item::Set(i) => {
+                    out.push_str(&self.results[i].to_text());
+                    out.push('\n');
+                }
+                Item::Message(i) => {
+                    out.push_str(&self.messages[i].text);
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 }
 
@@ -157,7 +245,7 @@ struct SavedTab {
 }
 
 #[derive(Clone)]
-enum ScriptKind {
+pub(crate) enum ScriptKind {
     SelectTop(u32),
     Create,
     Insert,
@@ -174,62 +262,146 @@ enum Pending {
     Children { server: u64, node: u64 },
     Databases { server: u64 },
     Script { server: u64, db: String, schema: String, name: String, kind: ScriptKind, run: bool },
+    Properties { server: u64, node: u64 },
 }
 
-enum Action {
+pub(crate) enum Action {
     Expand { server: u64, node: u64 },
     Refresh { server: u64, node: u64 },
     NewQuery { server: u64, db: Option<String> },
     Script { server: u64, db: String, schema: String, name: String, kind: ScriptKind, run: bool },
     Disconnect { server: u64 },
+    CollapseAll,
+    OpenTemplate(usize),
 }
 
 /// Results of background work that is not tied to one connection.
-enum AppMsg {
+pub(crate) enum AppMsg {
     Opened(PathBuf, String),
     SaveTo { tab: u64, path: PathBuf },
     ExportCsv { path: PathBuf, csv: String },
+    RunToFile { tab: u64, path: PathBuf },
     Password { key: String, password: String },
     /// Who the current Kerberos ticket belongs to.
     Principal(Result<String, String>),
     Error(String),
 }
 
-struct ConnectDialog {
-    info: ConnectionInfo,
-    show_options: bool,
+pub(crate) struct ConnectDialog {
+    pub info: ConnectionInfo,
+    pub show_options: bool,
     /// Open a query window once the connection is made.
-    then_query: bool,
+    pub then_query: bool,
     /// Connect this tab instead of adding a server to Object Explorer.
-    for_tab: Option<u64>,
+    pub for_tab: Option<u64>,
     /// The current Kerberos ticket, once looked up.
-    principal: Option<Result<String, String>>,
-    checking_principal: bool,
+    pub principal: Option<Result<String, String>>,
+    pub checking_principal: bool,
 }
 
-enum Confirm {
+pub(crate) enum Confirm {
     CloseTab(u64),
     Quit,
 }
 
+/// What the docking area holds.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Pane {
+    ObjectExplorer,
+    Properties,
+    Output,
+    TemplateBrowser,
+    Start,
+    Query(u64),
+}
+
+pub(crate) struct Properties {
+    pub node: Option<(u64, u64)>,
+    pub title: String,
+    pub loading: bool,
+    pub rows: Vec<(String, String)>,
+}
+
+/// Every command reachable from menus, toolbars and shortcuts.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Cmd {
+    ConnectObjectExplorer,
+    NewQuery,
+    OpenFile,
+    Save,
+    SaveAs,
+    SaveAll,
+    Close,
+    CloseAll,
+    Exit,
+    Find,
+    Replace,
+    FindNext,
+    GoTo,
+    Comment,
+    Uncomment,
+    Upper,
+    Lower,
+    Indent,
+    Unindent,
+    ShowObjectExplorer,
+    ShowProperties,
+    ShowOutput,
+    ShowTemplates,
+    FullScreen,
+    Execute,
+    Parse,
+    Cancel,
+    ChangeConnection,
+    Disconnect,
+    ResultsToGrid,
+    ResultsToText,
+    ResultsToFile,
+    ToggleResults,
+    TemplateParams,
+    SpHelp,
+    SpWho,
+    SpLock,
+    SaveResults,
+    Options,
+    ResetLayout,
+    NextDocument,
+    About,
+}
+
 pub struct App {
-    rt: tokio::runtime::Runtime,
-    settings: Settings,
-    servers: Vec<Server>,
-    tabs: Vec<QueryTab>,
-    active: usize,
+    pub(crate) rt: tokio::runtime::Runtime,
+    pub(crate) settings: Settings,
+    pub(crate) servers: Vec<Server>,
+    pub(crate) tabs: Vec<QueryTab>,
+    /// The query window menus and toolbars act on.
+    pub(crate) current: Option<u64>,
+    pub(crate) dock: DockState<Pane>,
     next_id: u64,
     query_counter: u32,
     pending: HashMap<u64, Pending>,
-    selected_node: Option<(u64, u64)>,
-    show_explorer: bool,
-    connect: Option<ConnectDialog>,
-    confirm: Option<Confirm>,
-    toast: Option<(String, bool, Instant)>,
-    show_about: bool,
-    msg_tx: std_mpsc::Sender<AppMsg>,
+    pub(crate) selected_node: Option<(u64, u64)>,
+    pub(crate) connect: Option<ConnectDialog>,
+    pub(crate) confirm: Option<Confirm>,
+    pub(crate) toast: Option<(String, bool, Instant)>,
+    pub(crate) show_about: bool,
+    pub(crate) show_options: bool,
+    pub(crate) goto: Option<String>,
+    pub(crate) template_params: Option<(u64, Vec<Param>)>,
+    pub(crate) props: Properties,
+    pub(crate) output: Vec<String>,
+    pub(crate) msg_tx: std_mpsc::Sender<AppMsg>,
     msg_rx: std_mpsc::Receiver<AppMsg>,
-    allow_quit: bool,
+    pub(crate) allow_quit: bool,
+    /// Ctrl+K was pressed; waiting for the second key of the chord.
+    pub(crate) chord: Option<Instant>,
+    pub(crate) fullscreen: bool,
+}
+
+pub(crate) fn default_dock() -> DockState<Pane> {
+    let mut dock = DockState::new(vec![Pane::Start]);
+    dock.main_surface_mut().split_left(NodeIndex::root(), 0.22, vec![Pane::ObjectExplorer]);
+    dock
 }
 
 impl App {
@@ -240,33 +412,40 @@ impl App {
             .build()
             .expect("tokio runtime");
         let settings = Settings::load();
-        cc.egui_ctx.set_theme(if settings.dark { egui::Theme::Dark } else { egui::Theme::Light });
-        apply_font_size(&cc.egui_ctx, settings.font_size);
         // Hack covers box-drawing and arrow glyphs the UI font lacks.
         let mut fonts = egui::FontDefinitions::default();
         if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             family.push("Hack".to_owned());
         }
         cc.egui_ctx.set_fonts(fonts);
+        theme::apply(&cc.egui_ctx, settings.theme);
+        apply_font_size(&cc.egui_ctx, settings.font_size);
         let (msg_tx, msg_rx) = std_mpsc::channel();
         let mut app = Self {
             rt,
             settings,
             servers: Vec::new(),
             tabs: Vec::new(),
-            active: 0,
+            current: None,
+            dock: default_dock(),
             next_id: 1,
             query_counter: 0,
             pending: HashMap::new(),
             selected_node: None,
-            show_explorer: true,
             connect: None,
             confirm: None,
             toast: None,
             show_about: false,
+            show_options: false,
+            goto: None,
+            template_params: None,
+            props: Properties { node: None, title: String::new(), loading: false, rows: Vec::new() },
+            output: Vec::new(),
             msg_tx,
             msg_rx,
             allow_quit: false,
+            chord: None,
+            fullscreen: false,
         };
         let saved: Vec<SavedTab> = cc
             .storage
@@ -281,21 +460,29 @@ impl App {
             tab.sql = t.sql;
             tab.saved_sql = t.saved_sql;
         }
-        app.active = 0;
+        app.log("SQLCraft started.");
         app.open_connect_dialog(false, None);
         app
     }
 
-    fn id(&mut self) -> u64 {
+    pub(crate) fn id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
     }
 
-    fn tab_mut(&mut self, id: u64) -> Option<&mut QueryTab> {
+    pub(crate) fn tab(&self, id: u64) -> Option<&QueryTab> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    pub(crate) fn tab_mut(&mut self, id: u64) -> Option<&mut QueryTab> {
         self.tabs.iter_mut().find(|t| t.id == id)
     }
 
-    fn server(&self, id: u64) -> Option<&Server> {
+    pub(crate) fn current_tab(&self) -> Option<&QueryTab> {
+        self.current.and_then(|id| self.tab(id))
+    }
+
+    pub(crate) fn server(&self, id: u64) -> Option<&Server> {
         self.servers.iter().find(|s| s.id == id)
     }
 
@@ -303,8 +490,25 @@ impl App {
         self.servers.iter_mut().find(|s| s.id == id)
     }
 
-    fn notify(&mut self, text: impl Into<String>, error: bool) {
-        self.toast = Some((text.into(), error, Instant::now()));
+    pub(crate) fn server_name(&self, tab: &QueryTab) -> Option<String> {
+        tab.session.as_ref().map(|s| s.info.server.trim().to_string())
+    }
+
+    pub(crate) fn notify(&mut self, text: impl Into<String>, error: bool) {
+        let text = text.into();
+        self.log(&text);
+        self.toast = Some((text, error, Instant::now()));
+    }
+
+    /// A line in the Output window.
+    pub(crate) fn log(&mut self, text: &str) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        for line in text.lines() {
+            self.output.push(format!("[{ts}] {line}"));
+        }
+        if self.output.len() > 5000 {
+            self.output.drain(..1000);
+        }
     }
 
     fn current_server(&self) -> Option<u64> {
@@ -313,19 +517,103 @@ impl App {
                 return Some(s);
             }
         }
-        if let Some(t) = self.tabs.get(self.active) {
-            if let Some(s) = t.server {
-                if self.server(s).is_some() {
-                    return Some(s);
-                }
+        if let Some(s) = self.current_tab().and_then(|t| t.server) {
+            if self.server(s).is_some() {
+                return Some(s);
             }
         }
         self.servers.first().map(|s| s.id)
     }
 
+    // ----- Docking ------------------------------------------------------------
+
+    /// Shows a tool window, docking it where SSMS puts it if it is closed.
+    pub(crate) fn show_pane(&mut self, pane: Pane) {
+        if let Some(path) = self.dock.find_tab(&pane) {
+            let _ = self.dock.set_active_tab(path);
+            self.dock.set_focused_node_and_surface(path.node_path());
+            return;
+        }
+        let tree = self.dock.main_surface_mut();
+        match pane {
+            Pane::ObjectExplorer => {
+                tree.split_left(NodeIndex::root(), 0.22, vec![pane]);
+            }
+            Pane::Properties | Pane::TemplateBrowser => {
+                let other = if pane == Pane::Properties { Pane::TemplateBrowser } else { Pane::Properties };
+                match self.dock.find_tab(&other) {
+                    Some(path) => {
+                        let _ = self.dock.leaf_mut(path.node_path()).map(|leaf| leaf.append_tab(pane));
+                    }
+                    None => {
+                        self.dock.main_surface_mut().split_right(NodeIndex::root(), 0.78, vec![pane]);
+                    }
+                }
+            }
+            Pane::Output => {
+                tree.split_below(NodeIndex::root(), 0.75, vec![pane]);
+            }
+            Pane::Start | Pane::Query(_) => self.place_document(pane),
+        }
+    }
+
+    /// Puts a document next to the other documents (replacing the Start page).
+    fn place_document(&mut self, pane: Pane) {
+        let anchor = self
+            .current
+            .and_then(|id| self.dock.find_tab(&Pane::Query(id)))
+            .or_else(|| self.dock.find_tab_from(|p| matches!(p, Pane::Query(_))))
+            .or_else(|| self.dock.find_tab(&Pane::Start));
+        match anchor {
+            Some(path) => {
+                if let Ok(leaf) = self.dock.leaf_mut(path.node_path()) {
+                    leaf.append_tab(pane.clone());
+                }
+            }
+            None => {
+                // No document well left: open one to the right of everything.
+                if self.dock.main_surface().is_empty() {
+                    self.dock = DockState::new(vec![pane.clone()]);
+                } else {
+                    self.dock.main_surface_mut().split_right(NodeIndex::root(), 0.25, vec![pane.clone()]);
+                }
+            }
+        }
+        if pane != Pane::Start {
+            if let Some(start) = self.dock.find_tab(&Pane::Start) {
+                self.dock.remove_tab(start);
+            }
+        }
+        if let Some(path) = self.dock.find_tab(&pane) {
+            let _ = self.dock.set_active_tab(path);
+            self.dock.set_focused_node_and_surface(path.node_path());
+        }
+    }
+
+    /// Keeps the Start page in the document well when no queries are open.
+    pub(crate) fn tidy_dock(&mut self) {
+        let has_doc = self.dock.find_tab_from(|p| matches!(p, Pane::Query(_) | Pane::Start)).is_some();
+        if !has_doc {
+            self.place_document(Pane::Start);
+        }
+        // Query windows whose tab was closed in the dock.
+        let open: Vec<u64> = self.dock.iter_all_tabs().filter_map(|(_, p)| if let Pane::Query(id) = p { Some(*id) } else { None }).collect();
+        let gone: Vec<u64> = self.tabs.iter().map(|t| t.id).filter(|id| !open.contains(id)).collect();
+        for id in gone {
+            self.drop_tab(id);
+        }
+        // Follow focus to pick the current query window.
+        if let Some((_, Pane::Query(id))) = self.dock.find_active_focused() {
+            self.current = Some(*id);
+        }
+        if self.current.is_some_and(|id| self.tab(id).is_none()) {
+            self.current = self.tabs.last().map(|t| t.id);
+        }
+    }
+
     // ----- Connections ----------------------------------------------------
 
-    fn open_connect_dialog(&mut self, then_query: bool, for_tab: Option<u64>) {
+    pub(crate) fn open_connect_dialog(&mut self, then_query: bool, for_tab: Option<u64>) {
         let info = self.settings.recent.first().cloned().unwrap_or_default();
         let key = info.key();
         let remember = info.remember_password;
@@ -342,7 +630,7 @@ impl App {
         }
     }
 
-    fn load_password(&self, key: String) {
+    pub(crate) fn load_password(&self, key: String) {
         let tx = self.msg_tx.clone();
         self.rt.spawn_blocking(move || {
             if let Some(password) = settings::load_password(&key) {
@@ -351,9 +639,10 @@ impl App {
         });
     }
 
-    fn connect_server(&mut self, ctx: &egui::Context, info: ConnectionInfo) -> u64 {
+    pub(crate) fn connect_server(&mut self, ctx: &egui::Context, info: ConnectionInfo) -> u64 {
         let id = self.id();
         let root_id = self.id();
+        self.log(&format!("Connecting to {}…", info.server.trim()));
         let session = Session::open(self.rt.handle(), info.clone(), None, ctx.clone());
         self.servers.push(Server {
             id,
@@ -364,10 +653,11 @@ impl App {
             databases: Vec::new(),
         });
         self.selected_node = Some((id, root_id));
+        self.show_pane(Pane::ObjectExplorer);
         id
     }
 
-    fn remember_connection(&mut self, info: &ConnectionInfo) {
+    pub(crate) fn remember_connection(&mut self, info: &ConnectionInfo) {
         self.settings.remember(info);
         let key = info.key();
         if info.remember_password && !info.password.is_empty() {
@@ -391,7 +681,7 @@ impl App {
         }
     }
 
-    fn add_tab(&mut self, server: Option<u64>, db: Option<String>) -> u64 {
+    pub(crate) fn add_tab(&mut self, server: Option<u64>, db: Option<String>) -> u64 {
         let id = self.id();
         self.query_counter += 1;
         let mut tab = QueryTab {
@@ -411,23 +701,30 @@ impl App {
             outcome: None,
             results: Vec::new(),
             messages: Vec::new(),
+            order: Vec::new(),
             view: ResultsView::Messages,
+            mode: if self.settings.results_to_text { ResultsMode::Text } else { ResultsMode::Grid },
             show_results: false,
             selection: None,
+            set_selection: None,
+            scroll_to_cursor: false,
             cell: None,
             focus_editor: true,
+            find: None,
+            file_target: None,
         };
         if let Some(s) = server.and_then(|s| self.server(s)) {
             tab.server = Some(s.id);
             tab.database = db.clone().unwrap_or_default();
         }
         self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
+        self.current = Some(id);
+        self.place_document(Pane::Query(id));
         id
     }
 
     /// Gives a tab its own connection to `server`, as SSMS does per window.
-    fn attach_tab(&mut self, ctx: &egui::Context, tab_id: u64, server: u64, db: Option<String>) {
+    pub(crate) fn attach_tab(&mut self, ctx: &egui::Context, tab_id: u64, server: u64, db: Option<String>) {
         let Some(info) = self.server(server).map(|s| s.session.info.clone()) else { return };
         let handle = self.rt.handle().clone();
         let Some(tab) = self.tab_mut(tab_id) else { return };
@@ -438,7 +735,7 @@ impl App {
         tab.connect_error = None;
     }
 
-    fn new_query(&mut self, ctx: &egui::Context, server: Option<u64>, db: Option<String>, sql: &str) -> u64 {
+    pub(crate) fn new_query(&mut self, ctx: &egui::Context, server: Option<u64>, db: Option<String>, sql: &str) -> u64 {
         let server = server.or_else(|| self.current_server());
         let id = self.add_tab(server, db.clone());
         if let Some(t) = self.tab_mut(id) {
@@ -450,22 +747,56 @@ impl App {
         id
     }
 
-    fn execute(&mut self, ctx: &egui::Context, tab_id: u64) {
-        let has_session = self.tab_mut(tab_id).is_some_and(|t| t.session.is_some());
-        if !has_session {
-            match self.tab_mut(tab_id).and_then(|t| t.server).or_else(|| self.current_server()) {
-                Some(server) => self.attach_tab(ctx, tab_id, server, None),
-                None => {
-                    self.open_connect_dialog(false, Some(tab_id));
-                    return;
-                }
+    /// Makes sure the tab has a connection; returns false if the user must connect first.
+    fn ensure_session(&mut self, ctx: &egui::Context, tab_id: u64) -> bool {
+        if self.tab(tab_id).is_some_and(|t| t.session.is_some()) {
+            return true;
+        }
+        match self.tab(tab_id).and_then(|t| t.server).or_else(|| self.current_server()) {
+            Some(server) => {
+                self.attach_tab(ctx, tab_id, server, None);
+                true
             }
+            None => {
+                self.open_connect_dialog(false, Some(tab_id));
+                false
+            }
+        }
+    }
+
+    /// Sends batches to the tab's connection and resets its results.
+    fn run(&mut self, ctx: &egui::Context, tab_id: u64, batches: Vec<Batch>) {
+        if !self.ensure_session(ctx, tab_id) {
+            return;
         }
         let max_rows = self.settings.max_rows;
         let Some(tab) = self.tab_mut(tab_id) else { return };
         if tab.running {
             return;
         }
+        tab.results.clear();
+        tab.messages.clear();
+        tab.order.clear();
+        tab.cell = None;
+        tab.show_results = true;
+        tab.view = ResultsView::Messages;
+        tab.outcome = None;
+        tab.elapsed = None;
+        if batches.is_empty() {
+            tab.messages.push(Message { text: "Commands completed successfully.".into(), is_error: false });
+            tab.order.push(Item::Message(0));
+            tab.outcome = Some(Outcome::Success);
+            return;
+        }
+        tab.running = true;
+        tab.started = Some(Instant::now());
+        if let Some(s) = &tab.session {
+            s.send(Request::Run { batches, max_rows });
+        }
+    }
+
+    /// The editor text to run: the selection if there is one, else everything.
+    fn script_to_run(tab: &QueryTab) -> Vec<Batch> {
         let text = match tab.selection {
             Some((a, b)) if a != b => tab.sql.chars().skip(a).take(b - a).collect::<String>(),
             _ => tab.sql.clone(),
@@ -479,26 +810,65 @@ impl App {
         for b in &mut batches {
             b.start_line += offset;
         }
-        tab.results.clear();
-        tab.messages.clear();
-        tab.cell = None;
-        tab.show_results = true;
-        tab.view = ResultsView::Messages;
-        tab.outcome = None;
-        tab.elapsed = None;
-        if batches.is_empty() {
-            tab.messages.push(Message { text: "Commands completed successfully.".into(), is_error: false });
-            tab.outcome = Some(Outcome::Success);
-            return;
-        }
-        tab.running = true;
-        tab.started = Some(Instant::now());
-        if let Some(s) = &tab.session {
-            s.send(Request::Run { batches, max_rows });
-        }
+        batches
     }
 
-    fn cancel(&mut self, tab_id: u64) {
+    pub(crate) fn execute(&mut self, ctx: &egui::Context, tab_id: u64) {
+        let Some(tab) = self.tab(tab_id) else { return };
+        if tab.mode == ResultsMode::File && tab.file_target.is_none() {
+            // SSMS asks for the file before running.
+            let tx = self.msg_tx.clone();
+            let name = tab.title.trim_end_matches(".sql").to_string();
+            self.rt.spawn(async move {
+                if let Some(f) = rfd::AsyncFileDialog::new()
+                    .set_title("Save Results")
+                    .set_file_name(format!("{name}.rpt"))
+                    .add_filter("Report Files", &["rpt"])
+                    .add_filter("All files", &["*"])
+                    .save_file()
+                    .await
+                {
+                    let _ = tx.send(AppMsg::RunToFile { tab: tab_id, path: f.path().to_path_buf() });
+                }
+            });
+            return;
+        }
+        let batches = Self::script_to_run(tab);
+        self.run(ctx, tab_id, batches);
+    }
+
+    /// Ctrl+F5: checks syntax without running anything.
+    fn parse(&mut self, ctx: &egui::Context, tab_id: u64) {
+        let Some(tab) = self.tab(tab_id) else { return };
+        let mut batches = Self::script_to_run(tab);
+        if batches.is_empty() {
+            return;
+        }
+        batches.insert(0, Batch { sql: "SET PARSEONLY ON".into(), start_line: 1, repeat: 1 });
+        batches.push(Batch { sql: "SET PARSEONLY OFF".into(), start_line: 1, repeat: 1 });
+        self.run(ctx, tab_id, batches);
+    }
+
+    /// Alt+F1, Ctrl+1, Ctrl+2: SSMS's built-in query shortcuts.
+    fn query_shortcut(&mut self, ctx: &egui::Context, tab_id: u64, cmd: Cmd) {
+        let Some(tab) = self.tab(tab_id) else { return };
+        let sql = match cmd {
+            Cmd::SpWho => "EXEC sp_who".to_string(),
+            Cmd::SpLock => "EXEC sp_lock".to_string(),
+            _ => {
+                let target = match tab.selection {
+                    Some((a, b)) if a != b => tab.sql.chars().skip(a).take(b - a).collect::<String>(),
+                    Some((a, _)) => tsql::word_at(&tab.sql, a),
+                    None => String::new(),
+                };
+                let target = target.trim();
+                if target.is_empty() { "EXEC sp_help".to_string() } else { format!("EXEC sp_help {}", lit(target)) }
+            }
+        };
+        self.run(ctx, tab_id, vec![Batch { sql, start_line: 1, repeat: 1 }]);
+    }
+
+    pub(crate) fn cancel(&mut self, tab_id: u64) {
         if let Some(t) = self.tab_mut(tab_id) {
             if t.running {
                 if let Some(s) = &t.session {
@@ -508,7 +878,7 @@ impl App {
         }
     }
 
-    fn change_database(&mut self, tab_id: u64, db: String) {
+    pub(crate) fn change_database(&mut self, tab_id: u64, db: String) {
         let tag = FIRE_AND_FORGET + self.id();
         if let Some(t) = self.tab_mut(tab_id) {
             match &t.session {
@@ -518,7 +888,7 @@ impl App {
         }
     }
 
-    fn request_close_tab(&mut self, tab_id: u64) {
+    pub(crate) fn request_close_tab(&mut self, tab_id: u64) {
         if self.tabs.iter().any(|t| t.id == tab_id && t.dirty() && !t.sql.trim().is_empty()) {
             self.confirm = Some(Confirm::CloseTab(tab_id));
         } else {
@@ -526,7 +896,14 @@ impl App {
         }
     }
 
-    fn close_tab(&mut self, tab_id: u64) {
+    pub(crate) fn close_tab(&mut self, tab_id: u64) {
+        if let Some(path) = self.dock.find_tab(&Pane::Query(tab_id)) {
+            self.dock.remove_tab(path);
+        }
+        self.drop_tab(tab_id);
+    }
+
+    fn drop_tab(&mut self, tab_id: u64) {
         if let Some(i) = self.tabs.iter().position(|t| t.id == tab_id) {
             let t = self.tabs.remove(i);
             if t.running {
@@ -534,48 +911,127 @@ impl App {
                     s.cancel();
                 }
             }
-            if self.active >= self.tabs.len() {
-                self.active = self.tabs.len().saturating_sub(1);
+        }
+        if self.current == Some(tab_id) {
+            self.current = self.tabs.last().map(|t| t.id);
+        }
+    }
+
+    // ----- Editor commands --------------------------------------------------
+
+    /// Applies a line or case edit to the current editor's selection.
+    fn edit(&mut self, cmd: Cmd) {
+        let Some(id) = self.current else { return };
+        let Some(tab) = self.tab_mut(id) else { return };
+        let (a, b) = tab.selection.unwrap_or((0, 0));
+        let new = match cmd {
+            Cmd::Comment => Some(tsql::comment(&mut tab.sql, a, b)),
+            Cmd::Uncomment => Some(tsql::uncomment(&mut tab.sql, a, b)),
+            Cmd::Indent => Some(tsql::indent(&mut tab.sql, a, b)),
+            Cmd::Unindent => Some(tsql::unindent(&mut tab.sql, a, b)),
+            Cmd::Upper | Cmd::Lower => {
+                tsql::change_case(&mut tab.sql, a, b, cmd == Cmd::Upper);
+                Some((a, b))
+            }
+            _ => None,
+        };
+        if let Some(sel) = new {
+            tab.set_selection = Some(sel);
+            tab.focus_editor = true;
+        }
+    }
+
+    pub(crate) fn find_next(&mut self) {
+        let Some(id) = self.current else { return };
+        let Some(tab) = self.tab_mut(id) else { return };
+        let Some(f) = &tab.find else { return };
+        let from = tab.selection.map_or(0, |s| s.1);
+        match tsql::find(&tab.sql, &f.needle, from, f.match_case) {
+            Some(r) => {
+                tab.set_selection = Some(r);
+                tab.scroll_to_cursor = true;
+            }
+            None => {
+                let needle = f.needle.clone();
+                self.notify(format!("The following specified text was not found: {needle}"), false);
             }
         }
     }
 
+    pub(crate) fn replace_one(&mut self) {
+        let Some(id) = self.current else { return };
+        let Some(tab) = self.tab_mut(id) else { return };
+        let Some(f) = &tab.find else { return };
+        let (Some(rep), Some((a, b))) = (f.replace.clone(), tab.selection) else { return };
+        let selected: String = tab.sql.chars().skip(a).take(b - a).collect();
+        let same = if f.match_case { selected == f.needle } else { selected.to_lowercase() == f.needle.to_lowercase() };
+        if a != b && same {
+            let (ba, bb) = (tsql::char_to_byte(&tab.sql, a), tsql::char_to_byte(&tab.sql, b));
+            tab.sql.replace_range(ba..bb, &rep);
+            tab.selection = Some((a, a + rep.chars().count()));
+        }
+        self.find_next();
+    }
+
+    pub(crate) fn replace_all(&mut self) {
+        let Some(id) = self.current else { return };
+        let Some(tab) = self.tab_mut(id) else { return };
+        let Some(f) = &tab.find else { return };
+        let Some(rep) = f.replace.clone() else { return };
+        let (needle, case) = (f.needle.clone(), f.match_case);
+        let mut count = 0;
+        let mut from = 0;
+        while let Some((a, b)) = tsql::find(&tab.sql, &needle, from, case) {
+            if a < from || count > 100_000 {
+                break; // wrapped around
+            }
+            let (ba, bb) = (tsql::char_to_byte(&tab.sql, a), tsql::char_to_byte(&tab.sql, b));
+            tab.sql.replace_range(ba..bb, &rep);
+            from = a + rep.chars().count();
+            count += 1;
+        }
+        self.notify(format!("{count} occurrence(s) replaced."), false);
+    }
+
     // ----- Files ------------------------------------------------------------
 
-    fn open_file(&self) {
+    pub(crate) fn open_file(&self) {
         let tx = self.msg_tx.clone();
         self.rt.spawn(async move {
             let picked = rfd::AsyncFileDialog::new()
                 .set_title("Open File")
-                .add_filter("SQL files", &["sql"])
+                .add_filter("SQL Server files", &["sql"])
                 .add_filter("All files", &["*"])
                 .pick_file()
                 .await;
             if let Some(f) = picked {
                 let path = f.path().to_path_buf();
-                let msg = match tokio::fs::read(&path).await {
-                    Ok(bytes) => AppMsg::Opened(path, decode_text(&bytes)),
-                    Err(e) => AppMsg::Error(format!("Could not open {}: {e}", path.display())),
-                };
-                let _ = tx.send(msg);
+                let _ = tx.send(read_file(path).await);
             }
         });
     }
 
-    fn save_tab(&mut self, tab_id: u64, save_as: bool) {
-        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+    pub(crate) fn open_recent(&self, path: PathBuf) {
+        let tx = self.msg_tx.clone();
+        self.rt.spawn(async move {
+            let _ = tx.send(read_file(path).await);
+        });
+    }
+
+    pub(crate) fn save_tab(&mut self, tab_id: u64, save_as: bool) {
+        let Some(tab) = self.tab(tab_id) else { return };
         if let (Some(path), false) = (&tab.path, save_as) {
             let path = path.clone();
             self.write_tab(tab_id, path);
             return;
         }
         let tx = self.msg_tx.clone();
-        let name = tab.title.trim_end_matches(" *").to_string();
+        let name = tab.title.clone();
         self.rt.spawn(async move {
             if let Some(f) = rfd::AsyncFileDialog::new()
                 .set_title("Save File As")
                 .set_file_name(name)
-                .add_filter("SQL files", &["sql"])
+                .add_filter("SQL Server files", &["sql"])
                 .save_file()
                 .await
             {
@@ -590,7 +1046,9 @@ impl App {
             Ok(()) => {
                 tab.saved_sql = tab.sql.clone();
                 tab.title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                tab.path = Some(path);
+                tab.path = Some(path.clone());
+                self.settings.remember_file(&path);
+                self.log(&format!("Saved {}", path.display()));
             }
             Err(e) => {
                 let text = format!("Could not save {}: {e}", path.display());
@@ -599,11 +1057,11 @@ impl App {
         }
     }
 
-    fn export_csv(&self, csv: String) {
+    pub(crate) fn export_csv(&self, csv: String) {
         let tx = self.msg_tx.clone();
         self.rt.spawn(async move {
             if let Some(f) = rfd::AsyncFileDialog::new()
-                .set_title("Save Results As")
+                .set_title("Save Grid Results")
                 .set_file_name("Results.csv")
                 .add_filter("CSV (Comma delimited)", &["csv"])
                 .save_file()
@@ -614,12 +1072,163 @@ impl App {
         });
     }
 
+    // ----- Commands ---------------------------------------------------------
+
+    pub(crate) fn command(&mut self, ctx: &egui::Context, cmd: Cmd) {
+        let cur = self.current;
+        match cmd {
+            Cmd::ConnectObjectExplorer => self.open_connect_dialog(false, None),
+            Cmd::NewQuery => {
+                if self.servers.is_empty() {
+                    self.open_connect_dialog(true, None);
+                } else {
+                    self.new_query(ctx, None, None, "");
+                }
+            }
+            Cmd::OpenFile => self.open_file(),
+            Cmd::Save | Cmd::SaveAs => {
+                if let Some(id) = cur {
+                    self.save_tab(id, cmd == Cmd::SaveAs);
+                }
+            }
+            Cmd::SaveAll => {
+                let dirty: Vec<u64> = self.tabs.iter().filter(|t| t.dirty()).map(|t| t.id).collect();
+                for id in dirty {
+                    self.save_tab(id, false);
+                }
+            }
+            Cmd::Close => {
+                if let Some(id) = cur {
+                    self.request_close_tab(id);
+                }
+            }
+            Cmd::CloseAll => {
+                let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+                for id in ids {
+                    self.request_close_tab(id);
+                }
+            }
+            Cmd::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Cmd::Find | Cmd::Replace => {
+                if let Some(t) = cur.and_then(|id| self.tab_mut(id)) {
+                    let selected: String = match t.selection {
+                        Some((a, b)) if a != b && b - a < 200 => t.sql.chars().skip(a).take(b - a).collect(),
+                        _ => String::new(),
+                    };
+                    let f = t.find.get_or_insert(FindBar { needle: String::new(), replace: None, match_case: false, focus: true });
+                    if !selected.is_empty() && !selected.contains('\n') {
+                        f.needle = selected;
+                    }
+                    f.focus = true;
+                    if cmd == Cmd::Replace && f.replace.is_none() {
+                        f.replace = Some(String::new());
+                    }
+                }
+            }
+            Cmd::FindNext => self.find_next(),
+            Cmd::GoTo => {
+                if cur.is_some() {
+                    self.goto = Some(String::new());
+                }
+            }
+            Cmd::Comment | Cmd::Uncomment | Cmd::Upper | Cmd::Lower | Cmd::Indent | Cmd::Unindent => self.edit(cmd),
+            Cmd::ShowObjectExplorer => self.show_pane(Pane::ObjectExplorer),
+            Cmd::ShowProperties => self.show_pane(Pane::Properties),
+            Cmd::ShowOutput => self.show_pane(Pane::Output),
+            Cmd::ShowTemplates => self.show_pane(Pane::TemplateBrowser),
+            Cmd::FullScreen => {
+                self.fullscreen = !self.fullscreen;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+            }
+            Cmd::Execute => {
+                if let Some(id) = cur {
+                    self.execute(ctx, id);
+                }
+            }
+            Cmd::Parse => {
+                if let Some(id) = cur {
+                    self.parse(ctx, id);
+                }
+            }
+            Cmd::Cancel => {
+                if let Some(id) = cur {
+                    self.cancel(id);
+                }
+            }
+            Cmd::ChangeConnection => self.open_connect_dialog(false, cur),
+            Cmd::Disconnect => {
+                if let Some(t) = cur.and_then(|id| self.tab_mut(id)) {
+                    t.session = None;
+                    t.server_info = None;
+                }
+            }
+            Cmd::ResultsToGrid | Cmd::ResultsToText | Cmd::ResultsToFile => {
+                if let Some(t) = cur.and_then(|id| self.tab_mut(id)) {
+                    t.mode = match cmd {
+                        Cmd::ResultsToGrid => ResultsMode::Grid,
+                        Cmd::ResultsToText => ResultsMode::Text,
+                        _ => ResultsMode::File,
+                    };
+                    t.file_target = None;
+                }
+            }
+            Cmd::ToggleResults => {
+                if let Some(t) = cur.and_then(|id| self.tab_mut(id)) {
+                    t.show_results = !t.show_results;
+                }
+            }
+            Cmd::TemplateParams => {
+                if let Some(t) = cur.and_then(|id| self.tab(id)) {
+                    let params = crate::templates::params(&t.sql);
+                    if params.is_empty() {
+                        self.notify("There are no template parameters in this query.", false);
+                    } else {
+                        self.template_params = Some((t.id, params));
+                    }
+                }
+            }
+            Cmd::SpHelp | Cmd::SpWho | Cmd::SpLock => {
+                if let Some(id) = cur {
+                    self.query_shortcut(ctx, id, cmd);
+                }
+            }
+            Cmd::SaveResults => {
+                let csv = self.current_tab().and_then(|t| t.results.first().map(|r| r.to_csv()));
+                match csv {
+                    Some(csv) => self.export_csv(csv),
+                    None => self.notify("There are no results to save.", true),
+                }
+            }
+            Cmd::Options => self.show_options = true,
+            Cmd::ResetLayout => {
+                let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+                self.dock = default_dock();
+                for id in ids {
+                    self.place_document(Pane::Query(id));
+                }
+            }
+            Cmd::NextDocument => {
+                if !self.tabs.is_empty() {
+                    let i = cur.and_then(|id| self.tabs.iter().position(|t| t.id == id)).map_or(0, |i| (i + 1) % self.tabs.len());
+                    let id = self.tabs[i].id;
+                    self.current = Some(id);
+                    if let Some(path) = self.dock.find_tab(&Pane::Query(id)) {
+                        let _ = self.dock.set_active_tab(path);
+                        self.dock.set_focused_node_and_surface(path.node_path());
+                    }
+                }
+            }
+            Cmd::About => self.show_about = true,
+        }
+    }
+
     // ----- Event pumps ----------------------------------------------------
 
-    fn pump(&mut self, ctx: &egui::Context) {
+    pub(crate) fn pump(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
                 AppMsg::Opened(path, text) => {
+                    self.settings.remember_file(&path);
                     let id = self.new_query(ctx, None, None, &text);
                     if let Some(t) = self.tab_mut(id) {
                         t.saved_sql = text;
@@ -632,6 +1241,12 @@ impl App {
                     Ok(()) => self.notify(format!("Saved {}", path.display()), false),
                     Err(e) => self.notify(format!("Could not save {}: {e}", path.display()), true),
                 },
+                AppMsg::RunToFile { tab, path } => {
+                    if let Some(t) = self.tab_mut(tab) {
+                        t.file_target = Some(path);
+                    }
+                    self.execute(ctx, tab);
+                }
                 AppMsg::Password { key, password } => {
                     if let Some(d) = &mut self.connect {
                         if d.info.key() == key && d.info.password.is_empty() {
@@ -652,26 +1267,29 @@ impl App {
         // Object Explorer connections.
         let mut fetched = Vec::new();
         let mut newly_connected = Vec::new();
+        let mut logs = Vec::new();
         for s in &mut self.servers {
             for ev in s.session.poll() {
                 match ev {
                     Event::Connected(info) => {
-                        s.root.label = format!(
-                            "{} (SQL Server {} - {})",
-                            s.session.info.server.trim(),
-                            info.version,
-                            info.login
-                        );
+                        s.root.label = format!("{} (SQL Server {} - {})", s.session.info.server.trim(), info.version, info.login);
+                        logs.push(format!("Connected to {} as {} (SQL Server {}).", s.session.info.server.trim(), info.login, info.version));
                         s.info = Some(info);
                         s.state = ServerState::Connected;
                         newly_connected.push(s.id);
                     }
                     Event::ConnectFailed(e) => s.state = ServerState::Failed(e),
                     Event::Fetched { tag, result } => fetched.push((tag, result)),
-                    Event::Disconnected(e) => s.root.error = Some(e),
+                    Event::Disconnected(e) => {
+                        logs.push(e.clone());
+                        s.root.error = Some(e);
+                    }
                     _ => {}
                 }
             }
+        }
+        for l in logs {
+            self.log(&l);
         }
         for id in newly_connected {
             self.fetch(
@@ -707,6 +1325,7 @@ impl App {
         }
 
         // Query windows.
+        let mut finished = Vec::new();
         for tab in &mut self.tabs {
             let Some(session) = &tab.session else { continue };
             let mut lost = false;
@@ -719,6 +1338,7 @@ impl App {
                     Event::ConnectFailed(e) => {
                         tab.connect_error = Some(e.clone());
                         tab.messages.push(Message { text: e, is_error: true });
+                        tab.order.push(Item::Message(tab.messages.len() - 1));
                         tab.show_results = true;
                         tab.view = ResultsView::Messages;
                         if tab.running {
@@ -728,17 +1348,21 @@ impl App {
                         lost = true;
                     }
                     Event::ResultStart(cols) => {
-                        if tab.results.is_empty() {
-                            tab.view = ResultsView::Set(0);
+                        if tab.results.is_empty() && tab.mode != ResultsMode::File {
+                            tab.view = ResultsView::Results;
                         }
                         tab.results.push(ResultSet::new(cols));
+                        tab.order.push(Item::Set(tab.results.len() - 1));
                     }
                     Event::Rows(rows) => {
                         if let Some(r) = tab.results.last_mut() {
                             r.add_rows(rows);
                         }
                     }
-                    Event::Message(m) => tab.messages.push(m),
+                    Event::Message(m) => {
+                        tab.messages.push(m);
+                        tab.order.push(Item::Message(tab.messages.len() - 1));
+                    }
                     Event::DatabaseChanged(db) => tab.database = db,
                     Event::RunDone { elapsed, errors, cancelled } => {
                         tab.running = false;
@@ -750,35 +1374,63 @@ impl App {
                         } else {
                             Outcome::Success
                         });
-                        if !errors && !cancelled && tab.messages.iter().all(|m| m.text.is_empty()) {
-                            tab.messages.clear();
-                        }
                         if tab.messages.is_empty() && tab.results.is_empty() {
-                            tab.messages.push(Message {
-                                text: "Commands completed successfully.".into(),
-                                is_error: false,
-                            });
+                            tab.messages.push(Message { text: "Commands completed successfully.".into(), is_error: false });
+                            tab.order.push(Item::Message(tab.messages.len() - 1));
                         }
                         tab.messages.push(Message {
                             text: format!("\nCompletion time: {}", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.7f%:z")),
                             is_error: false,
                         });
+                        tab.order.push(Item::Message(tab.messages.len() - 1));
                         if errors || cancelled {
                             tab.view = ResultsView::Messages;
+                        }
+                        if let Some(path) = tab.file_target.take() {
+                            finished.push((path, tab.text_output()));
                         }
                     }
                     Event::Fetched { result: Err(e), .. } => {
                         tab.messages.push(Message { text: e, is_error: true });
+                        tab.order.push(Item::Message(tab.messages.len() - 1));
                         tab.show_results = true;
                         tab.view = ResultsView::Messages;
                     }
                     Event::Fetched { .. } => {}
-                    Event::Disconnected(e) => tab.messages.push(Message { text: e, is_error: true }),
+                    Event::Disconnected(e) => {
+                        tab.messages.push(Message { text: e, is_error: true });
+                        tab.order.push(Item::Message(tab.messages.len() - 1));
+                    }
                 }
             }
             if lost {
                 tab.session = None;
             }
+        }
+        for (path, text) in finished {
+            match std::fs::write(&path, text) {
+                Ok(()) => self.notify(format!("Results saved to {}", path.display()), false),
+                Err(e) => self.notify(format!("Could not write {}: {e}", path.display()), true),
+            }
+        }
+
+        // Properties window follows the Object Explorer selection.
+        if self.props.node != self.selected_node && self.dock.find_tab(&Pane::Properties).is_some() {
+            self.load_properties();
+        }
+    }
+
+    fn load_properties(&mut self) {
+        self.props.node = self.selected_node;
+        self.props.rows.clear();
+        self.props.loading = false;
+        let Some((server, node)) = self.selected_node else { return };
+        let Some(s) = self.servers.iter_mut().find(|s| s.id == server) else { return };
+        let Some(n) = s.root.find_mut(node) else { return };
+        self.props.title = n.label.clone();
+        if let Some(sql) = explorer::properties_sql(&n.kind) {
+            self.props.loading = true;
+            self.fetch(server, sql, Pending::Properties { server, node });
         }
     }
 
@@ -790,6 +1442,20 @@ impl App {
                     if let Some(t) = tables.first() {
                         s.databases = (0..t.rows.len()).map(|r| t.get(r, "name").to_string()).collect();
                     }
+                }
+            }
+            Pending::Properties { server, node } => {
+                if self.props.node != Some((server, node)) {
+                    return;
+                }
+                self.props.loading = false;
+                match result {
+                    Ok(tables) => {
+                        if let Some(t) = tables.first().filter(|t| !t.rows.is_empty()) {
+                            self.props.rows = t.columns.iter().enumerate().map(|(i, c)| (c.clone(), t.rows[0][i].clone().unwrap_or_default())).collect();
+                        }
+                    }
+                    Err(e) => self.props.rows = vec![("Error".into(), e)],
                 }
             }
             Pending::Children { server, node } => {
@@ -829,12 +1495,7 @@ impl App {
                         .map(|r| {
                             (
                                 first.get(r, "name").to_string(),
-                                explorer::column_type(
-                                    first.get(r, "type_name"),
-                                    first.get(r, "max_length"),
-                                    first.get(r, "precision"),
-                                    first.get(r, "scale"),
-                                ),
+                                explorer::column_type(first.get(r, "type_name"), first.get(r, "max_length"), first.get(r, "precision"), first.get(r, "scale")),
                             )
                         })
                         .collect()
@@ -867,7 +1528,7 @@ impl App {
         }
     }
 
-    fn apply(&mut self, ctx: &egui::Context, action: Action) {
+    pub(crate) fn apply(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::Expand { server, node } | Action::Refresh { server, node } => {
                 let refresh = matches!(action, Action::Refresh { .. });
@@ -898,6 +1559,7 @@ impl App {
                     self.fetch(server, sql, Pending::Children { server, node });
                 }
                 if refresh {
+                    self.props.node = None;
                     self.fetch(
                         server,
                         "SELECT name FROM sys.databases WHERE state = 0 AND HAS_DBACCESS(name) = 1 ORDER BY name".into(),
@@ -926,690 +1588,37 @@ impl App {
                         "SELECT c.name, t.name AS type_name, c.max_length, c.precision, c.scale FROM {d}.sys.columns c \
                          JOIN {d}.sys.types t ON t.user_type_id = c.user_type_id WHERE c.object_id = OBJECT_ID({o}) ORDER BY c.column_id",
                         d = qi(&db),
-                        o = crate::format::lit(&format!("{}.{}.{}", qi(&db), qi(&schema), qi(&name)))
+                        o = lit(&format!("{}.{}.{}", qi(&db), qi(&schema), qi(&name)))
                     ),
                 };
                 self.fetch(server, fetch_sql, Pending::Script { server, db, schema, name, kind, run });
             }
             Action::Disconnect { server } => {
+                if let Some(s) = self.server(server) {
+                    let name = s.session.info.server.trim().to_string();
+                    self.log(&format!("Disconnected from {name}."));
+                }
                 self.servers.retain(|s| s.id != server);
                 if self.selected_node.is_some_and(|(s, _)| s == server) {
                     self.selected_node = None;
                 }
             }
-        }
-    }
-
-    // ----- UI ---------------------------------------------------------------
-
-    fn shortcuts(&mut self, ctx: &egui::Context) {
-        let active = self.tabs.get(self.active).map(|t| t.id);
-        let pressed = |s: &KeyboardShortcut| ctx.input_mut(|i| i.consume_shortcut(s));
-        if self.connect.is_some() || self.confirm.is_some() {
-            return;
-        }
-        if pressed(&EXECUTE) || pressed(&EXECUTE_ALT) {
-            if let Some(id) = active {
-                self.execute(ctx, id);
-            }
-        }
-        if pressed(&CANCEL) {
-            if let Some(id) = active {
-                self.cancel(id);
-            }
-        }
-        if pressed(&NEW_QUERY) {
-            if self.servers.is_empty() {
-                self.open_connect_dialog(true, None);
-            } else {
-                self.new_query(ctx, None, None, "");
-            }
-        }
-        if pressed(&OPEN) {
-            self.open_file();
-        }
-        if pressed(&SAVE) {
-            if let Some(id) = active {
-                self.save_tab(id, false);
-            }
-        }
-        if pressed(&CLOSE_TAB) || pressed(&CLOSE_TAB_ALT) {
-            if let Some(id) = active {
-                self.request_close_tab(id);
-            }
-        }
-        if pressed(&TOGGLE_RESULTS) {
-            if let Some(t) = self.tabs.get_mut(self.active) {
-                t.show_results = !t.show_results;
-            }
-        }
-        if pressed(&TOGGLE_EXPLORER) {
-            self.show_explorer = !self.show_explorer;
-        }
-        if pressed(&NEXT_TAB) && !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
-        }
-    }
-
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        let active = self.tabs.get(self.active).map(|t| t.id);
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.add(egui::Button::new("Connect Object Explorer…")).clicked() {
-                    self.open_connect_dialog(false, None);
-                }
-                if ui.add(egui::Button::new("New Query").shortcut_text(ctx.format_shortcut(&NEW_QUERY))).clicked() {
-                    if self.servers.is_empty() {
-                        self.open_connect_dialog(true, None);
-                    } else {
-                        self.new_query(&ctx, None, None, "");
-                    }
-                }
-                ui.separator();
-                if ui.add(egui::Button::new("Open File…").shortcut_text(ctx.format_shortcut(&OPEN))).clicked() {
-                    self.open_file();
-                }
-                ui.add_enabled_ui(active.is_some(), |ui| {
-                    if ui.add(egui::Button::new("Save").shortcut_text(ctx.format_shortcut(&SAVE))).clicked() {
-                        self.save_tab(active.unwrap(), false);
-                    }
-                    if ui.button("Save As…").clicked() {
-                        self.save_tab(active.unwrap(), true);
-                    }
-                    if ui.add(egui::Button::new("Close").shortcut_text(ctx.format_shortcut(&CLOSE_TAB))).clicked() {
-                        self.request_close_tab(active.unwrap());
-                    }
-                });
-                ui.separator();
-                if ui.button("Exit").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-            ui.menu_button("Query", |ui| {
-                ui.add_enabled_ui(active.is_some(), |ui| {
-                    let id = active.unwrap_or_default();
-                    if ui.add(egui::Button::new("Execute").shortcut_text(ctx.format_shortcut(&EXECUTE))).clicked() {
-                        self.execute(&ctx, id);
-                    }
-                    if ui.add(egui::Button::new("Cancel Executing Query").shortcut_text(ctx.format_shortcut(&CANCEL))).clicked() {
-                        self.cancel(id);
-                    }
-                    ui.separator();
-                    if ui.button("Change Connection…").clicked() {
-                        self.open_connect_dialog(false, Some(id));
-                    }
-                    if ui.add(egui::Button::new("Show Results Pane").shortcut_text(ctx.format_shortcut(&TOGGLE_RESULTS))).clicked() {
-                        if let Some(t) = self.tab_mut(id) {
-                            t.show_results = !t.show_results;
-                        }
-                    }
-                    if ui.button("Save Results As…").clicked() {
-                        let csv = self.tabs.get(self.active).and_then(|t| match t.view {
-                            ResultsView::Set(i) => t.results.get(i).map(|r| r.to_csv()),
-                            ResultsView::Messages => t.results.first().map(|r| r.to_csv()),
-                        });
-                        match csv {
-                            Some(csv) => self.export_csv(csv),
-                            None => self.notify("There are no results to save.", true),
-                        }
-                    }
-                });
-            });
-            ui.menu_button("View", |ui| {
-                if ui.add(egui::Button::new("Object Explorer").selected(self.show_explorer).shortcut_text(ctx.format_shortcut(&TOGGLE_EXPLORER))).clicked() {
-                    self.show_explorer = !self.show_explorer;
-                }
-                ui.separator();
-                if ui.radio(self.settings.dark, "Dark theme").clicked() {
-                    self.settings.dark = true;
-                    ctx.set_theme(egui::Theme::Dark);
-                    self.settings.save();
-                }
-                if ui.radio(!self.settings.dark, "Light theme").clicked() {
-                    self.settings.dark = false;
-                    ctx.set_theme(egui::Theme::Light);
-                    self.settings.save();
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Font size");
-                    if ui.add(egui::DragValue::new(&mut self.settings.font_size).range(9.0..=28.0).speed(0.2)).changed() {
-                        apply_font_size(&ctx, self.settings.font_size);
-                        self.settings.save();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Max rows per result");
-                    if ui.add(egui::DragValue::new(&mut self.settings.max_rows).range(100..=10_000_000).speed(1000)).changed() {
-                        self.settings.save();
-                    }
-                });
-            });
-            ui.menu_button("Help", |ui| {
-                if ui.button("Keyboard Shortcuts / About").clicked() {
-                    self.show_about = true;
-                }
-            });
-        });
-    }
-
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        ui.horizontal(|ui| {
-            if ui.button("📄 New Query").on_hover_text("New query window (Ctrl+N)").clicked() {
-                if self.servers.is_empty() {
-                    self.open_connect_dialog(true, None);
-                } else {
-                    self.new_query(&ctx, None, None, "");
+            Action::CollapseAll => {
+                for s in &self.servers {
+                    collapse(ctx, s.id, &s.root);
                 }
             }
-            if ui.button("📂").on_hover_text("Open file (Ctrl+O)").clicked() {
-                self.open_file();
-            }
-            let active = self.tabs.get(self.active).map(|t| t.id);
-            if let Some(id) = active {
-                if ui.button("💾").on_hover_text("Save (Ctrl+S)").clicked() {
-                    self.save_tab(id, false);
+            Action::OpenTemplate(i) => {
+                let t = &crate::templates::TEMPLATES[i];
+                let id = self.new_query(ctx, None, None, t.sql);
+                if let Some(tab) = self.tab_mut(id) {
+                    tab.title = format!("{}.sql", t.name.replace(' ', ""));
                 }
-                ui.separator();
-                let (running, server, current_db) = {
-                    let t = &self.tabs[self.active];
-                    (t.running, t.server, t.database.clone())
-                };
-                let dbs = server.and_then(|s| self.server(s)).map(|s| s.databases.clone()).unwrap_or_default();
-                let mut chosen = None;
-                ui.add_enabled_ui(!running && server.is_some(), |ui| {
-                    egui::ComboBox::from_id_salt("dbpick")
-                        .width(180.0)
-                        .selected_text(if current_db.is_empty() { "(no database)".to_string() } else { current_db.clone() })
-                        .show_ui(ui, |ui| {
-                            for db in &dbs {
-                                if ui.selectable_label(*db == current_db, db).clicked() {
-                                    chosen = Some(db.clone());
-                                }
-                            }
-                        })
-                        .response
-                        .on_hover_text("Available databases");
-                });
-                if let Some(db) = chosen {
-                    self.change_database(id, db);
-                }
-                let exec = ui.add_enabled(!running, egui::Button::new(RichText::new("▶ Execute").color(Color32::from_rgb(60, 170, 90))));
-                if exec.on_hover_text("Execute (F5). Runs the selection if text is selected.").clicked() {
-                    self.execute(&ctx, id);
-                }
-                if ui.add_enabled(running, egui::Button::new(RichText::new("⏹").color(Color32::from_rgb(220, 70, 60)))).on_hover_text("Cancel executing query (Alt+Break)").clicked() {
-                    self.cancel(id);
-                }
-                if ui.button("🔌").on_hover_text("Change connection").clicked() {
-                    self.open_connect_dialog(false, Some(id));
-                }
-            }
-        });
-    }
-
-    fn explorer_ui(&mut self, ui: &mut egui::Ui) {
-        let mut actions = Vec::new();
-        ui.horizontal(|ui| {
-            ui.strong("Object Explorer");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if let Some((s, n)) = self.selected_node {
-                    if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
-                        actions.push(Action::Refresh { server: s, node: n });
-                    }
-                    if ui.small_button("⏏").on_hover_text("Disconnect").clicked() {
-                        actions.push(Action::Disconnect { server: s });
-                    }
-                }
-                if ui.small_button("🔌 Connect").clicked() {
-                    self.open_connect_dialog(false, None);
-                }
-            });
-        });
-        ui.separator();
-        egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-            if self.servers.is_empty() {
-                ui.weak("Not connected. Use Connect to add a server.");
-            }
-            for s in &mut self.servers {
-                match &s.state {
-                    ServerState::Connecting => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(format!("Connecting to {}…", s.session.info.server.trim()));
-                        });
-                    }
-                    ServerState::Failed(_) => {}
-                    ServerState::Connected => {
-                        node_ui(ui, s.id, &mut s.root, &mut self.selected_node, &mut actions);
-                    }
-                }
-            }
-        });
-        let ctx = ui.ctx().clone();
-        for a in actions {
-            self.apply(&ctx, a);
-        }
-    }
-
-    fn tabs_ui(&mut self, ui: &mut egui::Ui) {
-        let mut close = None;
-        egui::ScrollArea::horizontal().id_salt("tabstrip").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (i, t) in self.tabs.iter().enumerate() {
-                    let mut title = t.title.clone();
-                    if t.dirty() {
-                        title.push_str(" *");
-                    }
-                    if let Some(info) = &t.server_info {
-                        title = format!("{title} - {} ({})", info.login, info.spid);
-                    }
-                    if t.running {
-                        title = format!("⏳ {title}");
-                    }
-                    let r = ui.selectable_label(i == self.active, title);
-                    if r.clicked() {
-                        self.active = i;
-                    }
-                    if r.middle_clicked() {
-                        close = Some(t.id);
-                    }
-                    if ui.small_button("🗙").on_hover_text("Close").clicked() {
-                        close = Some(t.id);
-                    }
-                    ui.add_space(6.0);
-                }
-            });
-        });
-        if let Some(id) = close {
-            self.request_close_tab(id);
-        }
-    }
-
-    fn query_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            ui.centered_and_justified(|ui| {
-                ui.weak("Press Ctrl+N or click New Query to open a query window.");
-            });
-            return;
-        };
-        let mut export = None;
-
-        egui::Panel::bottom(Id::unique(("status", tab.id))).exact_size(24.0).show(ui, |ui| status_bar(ui, tab));
-
-        if tab.show_results {
-            egui::Panel::bottom(Id::unique(("results", tab.id)))
-                .resizable(true)
-                .default_size(ui.available_height() * 0.45)
-                .min_size(80.0)
-                .show(ui, |ui| results_ui(ui, tab, &mut export));
-        }
-        egui::CentralPanel::no_frame().show(ui, |ui| editor_ui(ui, tab));
-
-        if let Some(csv) = export {
-            self.export_csv(csv);
-        }
-    }
-
-    fn connect_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(d) = &mut self.connect {
-            if d.info.auth == db::Auth::Kerberos && d.principal.is_none() && !d.checking_principal {
-                d.checking_principal = true;
-                let tx = self.msg_tx.clone();
-                self.rt.spawn_blocking(move || {
-                    let _ = tx.send(AppMsg::Principal(crate::kerberos::current_principal()));
-                });
-            }
-        }
-        let Some(d) = &mut self.connect else { return };
-        let mut go = false;
-        let mut cancel = false;
-        let mut pick: Option<ConnectionInfo> = None;
-        let mut forget: Option<String> = None;
-        let recent = &self.settings.recent;
-        let resp = egui::Modal::new(Id::unique("connect")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            ui.heading("Connect to Server");
-            ui.add_space(6.0);
-            egui::Grid::new("connect_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Server type:");
-                ui.label("Database Engine");
-                ui.end_row();
-
-                ui.label("Server name:");
-                ui.horizontal(|ui| {
-                    let r = ui.add(egui::TextEdit::singleline(&mut d.info.server).desired_width(260.0).hint_text(r"host, host\instance or host,port"));
-                    if d.info.server.is_empty() && !r.has_focus() {
-                        r.request_focus();
-                    }
-                    ui.menu_button("▾", |ui| {
-                        if recent.is_empty() {
-                            ui.weak("No recent connections");
-                        }
-                        for c in recent {
-                            ui.horizontal(|ui| {
-                                if ui.button(c.display()).clicked() {
-                                    pick = Some(c.clone());
-                                    ui.close();
-                                }
-                                if ui.small_button("🗑").on_hover_text("Remove from list").clicked() {
-                                    forget = Some(c.key());
-                                }
-                            });
-                        }
-                    });
-                });
-                ui.end_row();
-
-                ui.label("Authentication:");
-                egui::ComboBox::from_id_salt("auth").width(260.0).selected_text(d.info.auth.label()).show_ui(ui, |ui| {
-                    for a in db::Auth::ALL {
-                        ui.selectable_value(&mut d.info.auth, a, a.label());
-                    }
-                });
-                ui.end_row();
-
-                let kerberos = d.info.auth == db::Auth::Kerberos;
-                let (user_label, user_hint, pw_hint) = match d.info.auth {
-                    db::Auth::Kerberos => (
-                        "User name:",
-                        match &d.principal {
-                            Some(Ok(p)) => p.clone(),
-                            _ => "user@DOMAIN.COM".to_string(),
-                        },
-                        "blank = use current ticket",
-                    ),
-                    db::Auth::Windows => ("User name:", r"DOMAIN\user".to_string(), ""),
-                    db::Auth::SqlServer => ("Login:", String::new(), ""),
-                };
-                ui.label(user_label);
-                ui.add(egui::TextEdit::singleline(&mut d.info.user).hint_text(user_hint).desired_width(260.0));
-                ui.end_row();
-
-                ui.label("Password:");
-                let pw = ui.add(egui::TextEdit::singleline(&mut d.info.password).password(true).hint_text(pw_hint).desired_width(260.0));
-                if pw.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    go = true;
-                }
-                ui.end_row();
-
-                ui.label("");
-                ui.checkbox(&mut d.info.remember_password, "Remember password (system keyring)");
-                ui.end_row();
-
-                if kerberos {
-                    ui.label("");
-                    match &d.principal {
-                        None => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.weak("Checking for a Kerberos ticket…");
-                            });
-                        }
-                        Some(Ok(p)) => {
-                            ui.label(RichText::new(format!("✔ Signed in to the domain as {p}")).color(Color32::from_rgb(70, 170, 90)));
-                        }
-                        Some(Err(e)) => {
-                            let text = format!("No Kerberos ticket. Enter your domain user and password to sign in.\n{}", e.lines().next().unwrap_or(""));
-                            ui.vertical(|ui| {
-                                ui.set_max_width(300.0);
-                                ui.add(egui::Label::new(RichText::new(text).weak().small()).wrap());
-                            });
-                        }
-                    }
-                    ui.end_row();
-                }
-            });
-            ui.add_space(4.0);
-            egui::CollapsingHeader::new("Options").default_open(d.show_options).show(ui, |ui| {
-                egui::Grid::new("connect_opts").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                    ui.label("Database:");
-                    ui.add(egui::TextEdit::singleline(&mut d.info.database).hint_text("<default>").desired_width(240.0));
-                    ui.end_row();
-                    ui.label("Encrypt:");
-                    egui::ComboBox::from_id_salt("encrypt").width(240.0).selected_text(d.info.encrypt.label()).show_ui(ui, |ui| {
-                        for e in db::Encrypt::ALL {
-                            ui.selectable_value(&mut d.info.encrypt, e, e.label());
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("");
-                    ui.checkbox(&mut d.info.trust_cert, "Trust server certificate");
-                    ui.end_row();
-                    ui.label("Connection timeout:");
-                    ui.add(egui::DragValue::new(&mut d.info.timeout_secs).range(1..=600).suffix(" s"));
-                    ui.end_row();
-                    ui.label("Application name:");
-                    ui.add(egui::TextEdit::singleline(&mut d.info.app_name).desired_width(240.0));
-                    ui.end_row();
-                    if d.info.auth == db::Auth::Kerberos {
-                        ui.label("Service principal (SPN):");
-                        ui.add(egui::TextEdit::singleline(&mut d.info.spn).hint_text("automatic: MSSQLSvc/<fqdn>:<port>").desired_width(240.0));
-                        ui.end_row();
-                    }
-                });
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                    let ok = !d.info.server.trim().is_empty();
-                    if ui.add_enabled(ok, egui::Button::new("Connect")).clicked() {
-                        go = true;
-                    }
-                });
-            });
-        });
-        if resp.should_close() {
-            cancel = true;
-        }
-        if let Some(mut p) = pick {
-            let d = self.connect.as_mut().unwrap();
-            p.password.clear();
-            let key = p.key();
-            let remember = p.remember_password;
-            d.info = p;
-            if remember {
-                self.load_password(key);
-            }
-        }
-        if let Some(key) = forget {
-            self.settings.forget(&key);
-            self.rt.spawn_blocking(move || settings::delete_password(&key));
-        }
-        if go && self.connect.as_ref().is_some_and(|d| !d.info.server.trim().is_empty()) {
-            let d = self.connect.take().unwrap();
-            self.remember_connection(&d.info);
-            match d.for_tab {
-                Some(tab) => {
-                    // Reuse an Object Explorer connection to the same server, or add one.
-                    let key = d.info.key();
-                    let existing = self.servers.iter().find(|s| s.session.info.key() == key).map(|s| s.id);
-                    let server = existing.unwrap_or_else(|| self.connect_server(ctx, d.info.clone()));
-                    if let Some(t) = self.tab_mut(tab) {
-                        t.session = None;
-                        t.database.clear();
-                    }
-                    let db = Some(d.info.database.clone()).filter(|d| !d.trim().is_empty());
-                    self.attach_tab(ctx, tab, server, db);
-                }
-                None => {
-                    let server = self.connect_server(ctx, d.info.clone());
-                    if d.then_query {
-                        self.new_query(ctx, Some(server), None, "");
-                    }
-                }
-            }
-        } else if cancel {
-            self.connect = None;
-        }
-    }
-
-    fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(c) = &self.confirm else { return };
-        let text = match c {
-            Confirm::CloseTab(id) => {
-                let name = self.tabs.iter().find(|t| t.id == *id).map(|t| t.title.clone()).unwrap_or_default();
-                format!("Save changes to {name}?")
-            }
-            Confirm::Quit => "Some query windows have unsaved changes. Quit anyway?".to_string(),
-        };
-        let mut choice = None;
-        egui::Modal::new(Id::unique("confirm")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.label(text);
-            ui.add_space(10.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Cancel").clicked() {
-                    choice = Some(0);
-                }
-                match c {
-                    Confirm::CloseTab(_) => {
-                        if ui.button("Don't Save").clicked() {
-                            choice = Some(1);
-                        }
-                        if ui.button("Save").clicked() {
-                            choice = Some(2);
-                        }
-                    }
-                    Confirm::Quit => {
-                        if ui.button("Quit").clicked() {
-                            choice = Some(1);
-                        }
-                    }
-                }
-            });
-        });
-        let Some(choice) = choice else { return };
-        let c = self.confirm.take().unwrap();
-        match (c, choice) {
-            (_, 0) => {}
-            (Confirm::CloseTab(id), 1) => self.close_tab(id),
-            (Confirm::CloseTab(id), _) => self.save_tab(id, false),
-            (Confirm::Quit, _) => {
-                self.allow_quit = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
     }
 
-    fn about_dialog(&mut self, ctx: &egui::Context) {
-        if !self.show_about {
-            return;
-        }
-        let r = egui::Modal::new(Id::unique("about")).show(ctx, |ui| {
-            ui.heading(format!("SQLCraft {}", env!("CARGO_PKG_VERSION")));
-            ui.label("A SQL Server management studio for Linux.");
-            ui.add_space(8.0);
-            egui::Grid::new("keys").num_columns(2).striped(true).show(ui, |ui| {
-                for (k, v) in [
-                    ("F5 / Ctrl+E", "Execute (selection or whole script)"),
-                    ("Alt+Break", "Cancel executing query"),
-                    ("Ctrl+N", "New query window"),
-                    ("Ctrl+O / Ctrl+S", "Open / save file"),
-                    ("Ctrl+W / Ctrl+F4", "Close query window"),
-                    ("Ctrl+Tab", "Next query window"),
-                    ("Ctrl+R", "Show / hide results pane"),
-                    ("F8", "Show / hide Object Explorer"),
-                    ("Ctrl+C in grid", "Copy selected cell"),
-                ] {
-                    ui.monospace(k);
-                    ui.label(v);
-                    ui.end_row();
-                }
-            });
-            ui.add_space(8.0);
-            if ui.button("Close").clicked() {
-                self.show_about = false;
-            }
-        });
-        if r.should_close() {
-            self.show_about = false;
-        }
-    }
-
-    fn toast_ui(&mut self, ctx: &egui::Context) {
-        let Some((text, error, at)) = &self.toast else { return };
-        if at.elapsed() > Duration::from_secs(if *error { 10 } else { 4 }) {
-            self.toast = None;
-            return;
-        }
-        let mut close = false;
-        egui::Area::new(Id::unique("toast"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -36.0])
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_max_width(420.0);
-                    ui.horizontal(|ui| {
-                        let color = if *error { Color32::from_rgb(220, 80, 70) } else { Color32::from_rgb(70, 170, 90) };
-                        ui.label(RichText::new(if *error { "⚠" } else { "✔" }).color(color));
-                        ui.label(text.as_str());
-                        if ui.small_button("🗙").clicked() {
-                            close = true;
-                        }
-                    });
-                });
-            });
-        if close {
-            self.toast = None;
-        }
-        ctx.request_repaint_after(Duration::from_millis(500));
-    }
-}
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.pump(&ctx);
-        self.shortcuts(&ctx);
-
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit {
-            if self.tabs.iter().any(|t| t.dirty() && !t.sql.trim().is_empty() && t.path.is_some()) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.confirm = Some(Confirm::Quit);
-            }
-        }
-
-        let title = match self.tabs.get(self.active) {
-            Some(t) => format!("{} - SQLCraft", t.title),
-            None => "SQLCraft".to_string(),
-        };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-
-        egui::Panel::top("menu").show(ui, |ui| {
-            self.menu_bar(ui);
-            self.toolbar(ui);
-        });
-        if self.show_explorer {
-            egui::Panel::left("explorer")
-                .resizable(true)
-                .default_size(300.0)
-                .min_size(160.0)
-                .show(ui, |ui| self.explorer_ui(ui));
-        }
-        egui::CentralPanel::default_margins().show(ui, |ui| {
-            if !self.tabs.is_empty() {
-                self.tabs_ui(ui);
-                ui.separator();
-            }
-            self.query_ui(ui);
-        });
-
-        self.connect_dialog(&ctx);
-        self.confirm_dialog(&ctx);
-        self.about_dialog(&ctx);
-        self.toast_ui(&ctx);
-
-        if self.tabs.iter().any(|t| t.running) {
-            ctx.request_repaint_after(Duration::from_millis(250));
-        }
-    }
-
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+    pub(crate) fn save_state(&self, storage: &mut dyn eframe::Storage) {
         // Untitled scripts are restored on the next start (like SSMS auto-recover).
         let tabs: Vec<SavedTab> = self
             .tabs
@@ -1621,16 +1630,36 @@ impl eframe::App for App {
             storage.set_string("tabs", s);
         }
     }
+
+    pub(crate) fn status_color(&self, tab: &QueryTab) -> Option<Color32> {
+        tab.session.as_ref().and_then(|s| s.info.color).map(|[r, g, b]| Color32::from_rgb(r, g, b))
+    }
 }
 
-// ----- Free-standing widgets ---------------------------------------------
+fn collapse(ctx: &egui::Context, server: u64, node: &Node) {
+    let mut s = CollapsingState::load_with_default_open(ctx, node_ui_id(server, node.id), false);
+    s.set_open(false);
+    s.store(ctx);
+    if let Some(children) = &node.children {
+        for c in children {
+            collapse(ctx, server, c);
+        }
+    }
+}
 
-fn apply_font_size(ctx: &egui::Context, size: f32) {
+async fn read_file(path: PathBuf) -> AppMsg {
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => AppMsg::Opened(path, decode_text(&bytes)),
+        Err(e) => AppMsg::Error(format!("Could not open {}: {e}", path.display())),
+    }
+}
+
+pub(crate) fn apply_font_size(ctx: &egui::Context, size: f32) {
     ctx.all_styles_mut(|style| {
         for (ts, font) in style.text_styles.iter_mut() {
             font.size = match ts {
-                TextStyle::Small => size * 0.75,
-                TextStyle::Heading => size * 1.4,
+                egui::TextStyle::Small => size * 0.75,
+                egui::TextStyle::Heading => size * 1.4,
                 _ => size,
             };
         }
@@ -1641,406 +1670,41 @@ fn decode_text(bytes: &[u8]) -> String {
     // SSMS saves UTF-16 LE with a BOM by default.
     if bytes.starts_with(&[0xFF, 0xFE]) {
         let units: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-        return String::from_utf16_lossy(&units);
+        return String::from_utf16_lossy(&units).replace("\r\n", "\n");
     }
     if bytes.starts_with(&[0xFE, 0xFF]) {
         let units: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
-        return String::from_utf16_lossy(&units);
+        return String::from_utf16_lossy(&units).replace("\r\n", "\n");
     }
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     String::from_utf8_lossy(bytes).replace("\r\n", "\n")
 }
 
-fn node_ui_id(server: u64, node: u64) -> Id {
-    Id::unique(("oe", server, node))
+pub(crate) fn node_ui_id(server: u64, node: u64) -> egui::Id {
+    egui::Id::unique(("oe", server, node))
 }
 
-fn node_ui(ui: &mut egui::Ui, server: u64, node: &mut Node, selected: &mut Option<(u64, u64)>, actions: &mut Vec<Action>) {
-    let is_selected = *selected == Some((server, node.id));
-    let label = format!("{} {}", node.kind.icon(), node.label);
-    let header = |ui: &mut egui::Ui, node: &Node, selected: &mut Option<(u64, u64)>, actions: &mut Vec<Action>| {
-        let r = ui.selectable_label(is_selected, &label);
-        if r.clicked() || r.secondary_clicked() {
-            *selected = Some((server, node.id));
-        }
-        context_menu(&r, server, node, actions);
-        r
-    };
-    if !node.kind.expandable() {
-        ui.horizontal(|ui| {
-            ui.add_space(ui.spacing().indent);
-            let r = header(ui, node, selected, actions);
-            if r.double_clicked() {
-                if let Kind::Procedure { db, schema, name } | Kind::Function { db, schema, name, .. } = &node.kind {
-                    actions.push(Action::Script {
-                        server,
-                        db: db.clone(),
-                        schema: schema.clone(),
-                        name: name.clone(),
-                        kind: ScriptKind::Modify,
-                        run: false,
-                    });
-                }
-            }
-        });
-        return;
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
     }
-    let state = CollapsingState::load_with_default_open(ui.ctx(), node_ui_id(server, node.id), false);
-    if state.is_open() && node.children.is_none() && !node.loading {
-        actions.push(Action::Expand { server, node: node.id });
-    }
-    let mut toggle = false;
-    state
-        .show_header(ui, |ui| {
-            let r = header(ui, node, selected, actions);
-            if r.double_clicked() {
-                toggle = true;
-            }
-        })
-        .body(|ui| {
-            if node.loading {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak("Loading…");
-                });
-            }
-            if let Some(e) = &node.error {
-                ui.colored_label(Color32::from_rgb(220, 80, 70), e);
-            }
-            if let Some(children) = &mut node.children {
-                if children.is_empty() && node.error.is_none() {
-                    ui.weak("(empty)");
-                }
-                for c in children {
-                    node_ui(ui, server, c, selected, actions);
-                }
-            }
-        });
-    if toggle {
-        let mut s = CollapsingState::load_with_default_open(ui.ctx(), node_ui_id(server, node.id), false);
-        s.toggle(ui);
-        s.store(ui.ctx());
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.save_state(storage);
     }
 }
 
-fn context_menu(r: &egui::Response, server: u64, node: &Node, actions: &mut Vec<Action>) {
-    let script = |db: &str, schema: &str, name: &str, kind: ScriptKind, run: bool| Action::Script {
-        server,
-        db: db.into(),
-        schema: schema.into(),
-        name: name.into(),
-        kind,
-        run,
-    };
-    r.context_menu(|ui| {
-        match &node.kind {
-            Kind::Table { db, schema, name } => {
-                if ui.button("Select Top 1000 Rows").clicked() {
-                    actions.push(script(db, schema, name, ScriptKind::SelectTop(1000), true));
-                }
-                ui.menu_button("Script Table as", |ui| {
-                    for (label, kind) in [
-                        ("CREATE To New Query Window", ScriptKind::Create),
-                        ("SELECT To New Query Window", ScriptKind::SelectTop(1000)),
-                        ("INSERT To New Query Window", ScriptKind::Insert),
-                        ("UPDATE To New Query Window", ScriptKind::Update),
-                        ("DELETE To New Query Window", ScriptKind::Delete),
-                        ("DROP To New Query Window", ScriptKind::Drop("TABLE")),
-                    ] {
-                        if ui.button(label).clicked() {
-                            actions.push(script(db, schema, name, kind, false));
-                        }
-                    }
-                });
-                ui.separator();
-            }
-            Kind::View { db, schema, name } => {
-                if ui.button("Select Top 1000 Rows").clicked() {
-                    actions.push(script(db, schema, name, ScriptKind::SelectTop(1000), true));
-                }
-                ui.menu_button("Script View as", |ui| {
-                    if ui.button("CREATE To New Query Window").clicked() {
-                        actions.push(script(db, schema, name, ScriptKind::Definition, false));
-                    }
-                    if ui.button("ALTER To New Query Window").clicked() {
-                        actions.push(script(db, schema, name, ScriptKind::Modify, false));
-                    }
-                    if ui.button("DROP To New Query Window").clicked() {
-                        actions.push(script(db, schema, name, ScriptKind::Drop("VIEW"), false));
-                    }
-                });
-                ui.separator();
-            }
-            Kind::Procedure { db, schema, name } => {
-                if ui.button("Modify").clicked() {
-                    actions.push(script(db, schema, name, ScriptKind::Modify, false));
-                }
-                if ui.button("Execute Stored Procedure…").clicked() {
-                    actions.push(script(db, schema, name, ScriptKind::Execute, false));
-                }
-                ui.menu_button("Script Stored Procedure as", |ui| {
-                    if ui.button("CREATE To New Query Window").clicked() {
-                        actions.push(script(db, schema, name, ScriptKind::Definition, false));
-                    }
-                    if ui.button("DROP To New Query Window").clicked() {
-                        actions.push(script(db, schema, name, ScriptKind::Drop("PROCEDURE"), false));
-                    }
-                });
-                ui.separator();
-            }
-            Kind::Function { db, schema, name, .. } => {
-                if ui.button("Modify").clicked() {
-                    actions.push(script(db, schema, name, ScriptKind::Modify, false));
-                }
-                ui.menu_button("Script Function as", |ui| {
-                    if ui.button("CREATE To New Query Window").clicked() {
-                        actions.push(script(db, schema, name, ScriptKind::Definition, false));
-                    }
-                    if ui.button("DROP To New Query Window").clicked() {
-                        actions.push(script(db, schema, name, ScriptKind::Drop("FUNCTION"), false));
-                    }
-                });
-                ui.separator();
-            }
-            _ => {}
-        }
-        if matches!(node.kind, Kind::Server | Kind::Database { .. }) || node.kind.database().is_some() {
-            if ui.button("New Query").clicked() {
-                actions.push(Action::NewQuery { server, db: node.kind.database().map(String::from) });
-            }
-        }
-        if node.kind.expandable() && ui.button("Refresh").clicked() {
-            actions.push(Action::Refresh { server, node: node.id });
-        }
-        if matches!(node.kind, Kind::Server) && ui.button("Disconnect").clicked() {
-            actions.push(Action::Disconnect { server });
-        }
-        if ui.button("Copy Name").clicked() {
-            let name = match &node.kind {
-                Kind::Table { schema, name, .. } | Kind::View { schema, name, .. } | Kind::Procedure { schema, name, .. } | Kind::Function { schema, name, .. } => {
-                    format!("{}.{}", qi(schema), qi(name))
-                }
-                Kind::Database { db } => qi(db),
-                _ => node.label.split(" (").next().unwrap_or(&node.label).to_string(),
-            };
-            ui.ctx().copy_text(name);
-        }
-    });
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Approximate monospace layout for T-SQL with syntax colours.
-fn editor_ui(ui: &mut egui::Ui, tab: &mut QueryTab) {
-    let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(ui.ctx(), ui.style());
-    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
-        let mut job = egui_extras::syntax_highlighting::highlight(ui.ctx(), ui.style(), &theme, text.as_str(), "sql");
-        job.wrap.max_width = f32::INFINITY;
-        ui.fonts_mut(|f| f.layout_job(job))
-    };
-    let lines = tab.sql.matches('\n').count() + 1;
-    egui::ScrollArea::both().id_salt(("editor", tab.id)).auto_shrink([false, false]).show(ui, |ui| {
-        ui.horizontal_top(|ui| {
-            let gutter: String = (1..=lines).map(|n| format!("{n:>4}\n")).collect();
-            ui.add(
-                egui::Label::new(RichText::new(gutter.trim_end()).monospace().weak())
-                    .selectable(false)
-                    .wrap_mode(egui::TextWrapMode::Extend),
-            );
-            let out = egui::TextEdit::multiline(&mut tab.sql)
-                .id(Id::unique(("sql", tab.id)))
-                .code_editor()
-                .frame(egui::Frame::NONE)
-                .desired_width(ui.available_width())
-                .desired_rows(30)
-                .lock_focus(true)
-                .layouter(&mut layouter)
-                .show(ui);
-            if tab.focus_editor {
-                out.response.request_focus();
-                tab.focus_editor = false;
-            }
-            if let Some(range) = out.cursor_range {
-                let [a, b] = range.sorted_cursors();
-                tab.selection = Some((a.index.into(), b.index.into()));
-            }
-        });
-    });
-}
-
-fn status_bar(ui: &mut egui::Ui, tab: &QueryTab) {
-    ui.horizontal_centered(|ui| {
-        let (icon, text, color) = if tab.running {
-            ("⏳", "Executing query…", ui.visuals().text_color())
-        } else if let Some(e) = &tab.connect_error {
-            ("⚠", e.as_str(), Color32::from_rgb(220, 80, 70))
-        } else {
-            match tab.outcome {
-                Some(Outcome::Success) => ("✔", "Query executed successfully.", Color32::from_rgb(70, 170, 90)),
-                Some(Outcome::Errors) => ("⚠", "Query completed with errors.", Color32::from_rgb(220, 80, 70)),
-                Some(Outcome::Cancelled) => ("⏹", "Query was cancelled by user.", Color32::from_rgb(220, 160, 60)),
-                None if tab.session.is_none() => ("○", "Disconnected.", ui.visuals().weak_text_color()),
-                None if tab.server_info.is_none() => ("…", "Connecting…", ui.visuals().text_color()),
-                None => ("●", "Connected.", Color32::from_rgb(70, 170, 90)),
-            }
-        };
-        ui.label(RichText::new(icon).color(color));
-        ui.label(RichText::new(text).color(color));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let elapsed = if tab.running {
-                tab.started.map(|s| s.elapsed())
-            } else {
-                tab.elapsed
-            };
-            let rows = tab.total_rows();
-            ui.monospace(format!("{rows} row{}", if rows == 1 { "" } else { "s" }));
-            ui.separator();
-            if let Some(e) = elapsed {
-                let s = e.as_secs();
-                ui.monospace(format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60));
-                ui.separator();
-            }
-            if let Some(info) = &tab.server_info {
-                ui.label(&tab.database);
-                ui.separator();
-                ui.label(format!("{} ({})", info.login, info.spid));
-                ui.separator();
-                ui.label(format!("{} ({})", info.server_name, info.version)).on_hover_text(&info.edition);
-            }
-        });
-    });
-}
-
-fn results_ui(ui: &mut egui::Ui, tab: &mut QueryTab, export: &mut Option<String>) {
-    ui.horizontal(|ui| {
-        for i in 0..tab.results.len() {
-            let label = if tab.results.len() == 1 { "▦ Results".to_string() } else { format!("▦ Results {}", i + 1) };
-            ui.selectable_value(&mut tab.view, ResultsView::Set(i), label);
-        }
-        let errors = tab.messages.iter().any(|m| m.is_error);
-        let msg_label = if errors { RichText::new("💬 Messages").color(Color32::from_rgb(220, 80, 70)) } else { RichText::new("💬 Messages") };
-        ui.selectable_value(&mut tab.view, ResultsView::Messages, msg_label);
-    });
-    ui.separator();
-    match tab.view {
-        ResultsView::Messages => {
-            egui::ScrollArea::both().id_salt(("msgs", tab.id)).auto_shrink([false, false]).stick_to_bottom(tab.running).show(ui, |ui| {
-                for m in &tab.messages {
-                    let text = RichText::new(&m.text).monospace();
-                    let text = if m.is_error { text.color(Color32::from_rgb(230, 80, 70)) } else { text };
-                    ui.add(egui::Label::new(text).selectable(true));
-                }
-            });
-        }
-        ResultsView::Set(i) => {
-            if let Some(set) = tab.results.get(i) {
-                grid_ui(ui, tab.id, i, set, &mut tab.cell, export);
-            }
-        }
-    }
-}
-
-fn grid_ui(ui: &mut egui::Ui, tab_id: u64, set_idx: usize, set: &ResultSet, cell: &mut Option<(usize, usize, usize)>, export: &mut Option<String>) {
-    let row_h = ui.text_style_height(&TextStyle::Monospace) + 6.0;
-    let null_bg = if ui.visuals().dark_mode { Color32::from_rgb(70, 66, 30) } else { Color32::from_rgb(255, 255, 225) };
-    let selected_bg = ui.visuals().selection.bg_fill;
-    let current = cell.filter(|c| c.0 == set_idx);
-
-    // Copy the selected cell with Ctrl+C when no text field has focus.
-    if let Some((_, r, c)) = current {
-        let copy = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
-        if copy && ui.memory(|m| m.focused().is_none()) {
-            if let Some(v) = set.rows.get(r).and_then(|row| row.get(c)) {
-                ui.ctx().copy_text(v.clone().unwrap_or_else(|| "NULL".into()));
-            }
-        }
-    }
-
-    let mut clicked = None;
-    let mut table = TableBuilder::new(ui)
-        .id_salt(("grid", tab_id, set_idx))
-        .striped(true)
-        .resizable(true)
-        .auto_shrink([false, false])
-        .cell_layout(Layout::left_to_right(Align::Center))
-        .column(Column::exact(52.0));
-    for w in &set.widths {
-        table = table.column(Column::initial(*w).at_least(30.0).clip(true).resizable(true));
-    }
-    table
-        .header(row_h + 2.0, |mut header| {
-            header.col(|_| {});
-            for c in &set.columns {
-                header.col(|ui| {
-                    ui.strong(&c.name).on_hover_text(c.type_name);
-                });
-            }
-        })
-        .body(|body| {
-            body.rows(row_h, set.rows.len(), |mut row| {
-                let r = row.index();
-                row.set_selected(current.is_some_and(|c| c.1 == r));
-                row.col(|ui| {
-                    ui.weak(format!("{}", r + 1));
-                });
-                for (c, value) in set.rows[r].iter().enumerate() {
-                    let numeric = set.columns[c].numeric;
-                    let (rect, resp) = row.col(|ui| {
-                        let is_cell = current.is_some_and(|x| x.1 == r && x.2 == c);
-                        if is_cell {
-                            ui.painter().rect_filled(ui.max_rect(), 0.0, selected_bg);
-                        }
-                        let layout = if numeric { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
-                        ui.with_layout(layout, |ui| match value {
-                            None => {
-                                ui.painter().rect_filled(ui.max_rect(), 0.0, null_bg);
-                                ui.label(RichText::new("NULL").monospace().italics());
-                            }
-                            Some(v) => {
-                                let shown: String = v.chars().take(400).map(|ch| if ch == '\n' || ch == '\r' || ch == '\t' { ' ' } else { ch }).collect();
-                                ui.add(egui::Label::new(RichText::new(shown).monospace()).truncate().selectable(false));
-                            }
-                        });
-                    });
-                    let _ = rect;
-                    let resp = resp.interact(Sense::click());
-                    if resp.clicked() || resp.secondary_clicked() {
-                        clicked = Some((set_idx, r, c));
-                    }
-                    resp.context_menu(|ui| {
-                        if ui.button("Copy").clicked() {
-                            ui.ctx().copy_text(value.clone().unwrap_or_else(|| "NULL".into()));
-                        }
-                        if ui.button("Copy Row").clicked() {
-                            ui.ctx().copy_text(set.row_line(r, "\t"));
-                        }
-                        if ui.button("Copy Row with Headers").clicked() {
-                            ui.ctx().copy_text(format!("{}\n{}", set.header_line("\t"), set.row_line(r, "\t")));
-                        }
-                        if ui.button("Copy Column").clicked() {
-                            let col: Vec<_> = set.rows.iter().map(|row| row[c].as_deref().unwrap_or("NULL")).collect();
-                            ui.ctx().copy_text(col.join("\n"));
-                        }
-                        if ui.button("Copy All with Headers").clicked() {
-                            let mut s = set.header_line("\t");
-                            for i in 0..set.rows.len() {
-                                s.push('\n');
-                                s.push_str(&set.row_line(i, "\t"));
-                            }
-                            ui.ctx().copy_text(s);
-                        }
-                        ui.separator();
-                        if ui.button("Save Results As…").clicked() {
-                            *export = Some(set.to_csv());
-                        }
-                    });
-                }
-            });
-        });
-    if let Some(c) = clicked {
-        *cell = Some(c);
-        ui.memory_mut(|m| {
-            if let Some(f) = m.focused() {
-                m.surrender_focus(f);
-            }
-        });
+    #[test]
+    fn text_results() {
+        let mut r = ResultSet::new(vec![
+            ColumnInfo { name: "id".into(), type_name: "int", numeric: true },
+            ColumnInfo { name: "name".into(), type_name: "nvarchar", numeric: false },
+        ]);
+        r.add_rows(vec![vec![Some("1".into()), Some("Ann".into())], vec![Some("10".into()), None]]);
+        assert_eq!(r.to_text(), "id name\n-- ----\n 1 Ann\n10 NULL\n");
     }
 }

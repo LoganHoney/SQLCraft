@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::db::ConnectionInfo;
+use crate::theme::ThemeKind;
 
 const KEYRING_SERVICE: &str = "sqlcraft";
 const MAX_RECENT: usize = 15;
@@ -13,15 +14,24 @@ const MAX_RECENT: usize = 15;
 #[serde(default)]
 pub struct Settings {
     pub recent: Vec<ConnectionInfo>,
-    pub dark: bool,
+    pub theme: ThemeKind,
     /// Rows kept per result set in the grid.
     pub max_rows: usize,
     pub font_size: f32,
+    pub results_to_text: bool,
+    pub recent_files: Vec<PathBuf>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { recent: Vec::new(), dark: true, max_rows: 1_000_000, font_size: 14.0 }
+        Self {
+            recent: Vec::new(),
+            theme: ThemeKind::Dark,
+            max_rows: 1_000_000,
+            font_size: 14.0,
+            results_to_text: false,
+            recent_files: Vec::new(),
+        }
     }
 }
 
@@ -53,6 +63,13 @@ impl Settings {
         self.recent.retain(|c| c.key() != key);
         self.recent.insert(0, info.clone());
         self.recent.truncate(MAX_RECENT);
+        self.save();
+    }
+
+    pub fn remember_file(&mut self, path: &std::path::Path) {
+        self.recent_files.retain(|p| p != path);
+        self.recent_files.insert(0, path.to_path_buf());
+        self.recent_files.truncate(10);
         self.save();
     }
 

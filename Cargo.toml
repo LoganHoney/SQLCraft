@@ -1,6 +1,6 @@
 [package]
 name = "sqlcraft"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "SQL Server management studio for Linux"
 license = "MIT"
@@ -10,7 +10,8 @@ chrono = "0.4.45"
 directories = "6.0.0"
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence"] }
 egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
-egui_extras = { version = "0.37.0", features = ["syntect"] }
+egui_dock = { version = "0.22.0", features = ["serde"] }
+egui_extras = "0.37.0"
 futures-util = "0.3.34"
 keyring = "4.2.0"
 libc = "0.2.191"
