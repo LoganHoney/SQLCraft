@@ -18,7 +18,7 @@ done
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 flatpak install --user -y --noninteractive flathub \
     "org.freedesktop.Platform//$BRANCH" "org.freedesktop.Sdk//$BRANCH" \
-    "org.freedesktop.Sdk.Extension.rust-stable//$BRANCH"
+    "org.freedesktop.Sdk.Extension.rust-stable//$BRANCH" "org.freedesktop.Sdk.Extension.llvm21//$BRANCH"
 
 # Keep the offline crate list in step with Cargo.lock.
 python3 gen-cargo-sources.py

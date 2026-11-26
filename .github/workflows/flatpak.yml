@@ -33,9 +33,9 @@ jobs:
         run: |
           set -o pipefail
           # The image ships the 25.08 Platform and Sdk; updating them in place
-          # fails ("Invalid cross-device link"), so only add the Rust extension.
+          # fails ("Invalid cross-device link"), so only add the Rust and LLVM extensions.
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user -y --noninteractive flathub org.freedesktop.Sdk.Extension.rust-stable//25.08
+          flatpak install --user -y --noninteractive flathub org.freedesktop.Sdk.Extension.rust-stable//25.08 org.freedesktop.Sdk.Extension.llvm21//25.08
           flatpak list --runtime --columns=application,branch,installation
           if ! flatpak-builder --repo=repo --disable-rofiles-fuse \
                 --force-clean build-dir flatpak/io.github.loganhoney.SQLCraft.yml 2>&1 | tee build.log; then

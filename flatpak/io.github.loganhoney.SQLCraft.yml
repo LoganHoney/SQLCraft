@@ -4,6 +4,8 @@ runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
+  # libclang, for generating the Kerberos (GSSAPI) bindings at build time.
+  - org.freedesktop.Sdk.Extension.llvm21
 command: sqlcraft
 finish-args:
   - --share=ipc
@@ -23,8 +25,10 @@ finish-args:
   # Files are opened and saved through the file chooser portal, so no home
   # directory access is needed.
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin
+  append-ld-library-path: /usr/lib/sdk/llvm21/lib
   env:
+    LIBCLANG_PATH: /usr/lib/sdk/llvm21/lib
     CARGO_HOME: /run/build/sqlcraft/cargo
     CARGO_NET_OFFLINE: 'true'
 cleanup:
